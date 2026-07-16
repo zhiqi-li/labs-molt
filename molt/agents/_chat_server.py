@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -306,6 +307,13 @@ def _build_sampling_params(base_sampling, body: dict):
     requested = body.get("max_completion_tokens", body.get("max_tokens"))
     if requested is not None:
         sp.max_tokens = int(requested)
+    configured_cap = os.environ.get("NANOBOT_PER_TURN_MAX_TOKENS", "").strip()
+    if configured_cap:
+        cap = int(configured_cap)
+        if cap <= 0:
+            raise ValueError("NANOBOT_PER_TURN_MAX_TOKENS must be positive")
+        if sp.max_tokens is None or sp.max_tokens > cap:
+            sp.max_tokens = cap
     if body.get("temperature") is not None:
         sp.temperature = float(body["temperature"])
     if body.get("top_p") is not None:
