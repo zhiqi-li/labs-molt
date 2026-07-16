@@ -288,6 +288,11 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
         )
         remaining = state.max_length - len(prompt_ids) - image_budget
         if remaining <= 0:  # prompt alone fills the context -> generate nothing; stitch drops empty rollouts
+            # A post-compaction prompt can overflow before producing a new
+            # segment. Preserve that terminal generation cutoff on the last
+            # trainable segment instead of losing the rollout evidence.
+            if session.trajectories:
+                session.trajectories[-1].truncated = True
             session.last_messages, session.last_response = messages, ("", "length")
             return "", "length"
         # Built but NOT yet attached to the session: a failed generate below must leave the session
@@ -379,7 +384,15 @@ def stitch_session(state: ChatServerState, session_id: str, result):
     for traj in session.trajectories:
         traj.reward = result.reward
         traj.scores = result.score if result.score is not None else result.reward
-        traj.extra_logs = result.info or {}
+        traj.extra_logs = dict(result.info or {})
+        # Keep the model-generation/context cutoff separate from the terminal
+        # environment outcome. ``Trajectory.truncated`` still preserves the
+        # Gymnasium-style union below, while eval integrity can independently
+        # distinguish a provider length cutoff from an action-budget horizon.
+        traj.extra_logs["generation_truncated"] = bool(traj.truncated)
+        # Environment-level horizons (for example a VLN action budget) are
+        # independent from a model generation ending with finish_reason=length.
+        traj.truncated = traj.truncated or bool(result.truncated)
         if result.images is not None:
             traj.images = result.images
     return session.trajectories

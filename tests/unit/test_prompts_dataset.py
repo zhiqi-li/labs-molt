@@ -20,10 +20,22 @@ Locks the invariants of the f193c302 data path — the bug classes these guard
 invisible to reward/vllm_kl at run time.
 """
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
 from PIL import Image
+
+if "vllm" not in sys.modules:
+    fake_vllm = types.ModuleType("vllm")
+
+    class SamplingParams:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_vllm.SamplingParams = SamplingParams
+    sys.modules["vllm"] = fake_vllm
 
 from molt.agents.chat_agent import _wire_messages
 from molt.datasets.prompts_dataset import PromptDataset, preprocess_data
@@ -147,3 +159,20 @@ def test_eval_metrics_maps_chat_list_prompts_to_datasource():
     )
     metrics = compute_eval_metrics(eval_dataloader, [sample], n_samples_per_prompt=1)
     assert metrics["eval_geo3k_pass1"] == 1.0  # datasource resolved via the last user turn text
+
+
+def test_eval_truncated_rate_uses_generation_signal_when_available():
+    eval_dataloader = [(["geo3k"], [[{"role": "user", "content": "q"}]], ["a"], [None], [None])]
+    sample = SimpleNamespace(
+        prompts=["q"],
+        group_ids=["g1"],
+        rewards=[0.0],
+        response_length=[7],
+        truncated=[True],
+        info={"generation_truncated": [False], "truncated": [True]},
+    )
+
+    metrics = compute_eval_metrics(eval_dataloader, [sample], n_samples_per_prompt=1)
+
+    assert metrics["eval_geo3k_truncated_rate"] == 0.0
+    assert metrics["eval_truncated_rate"] == 0.0
