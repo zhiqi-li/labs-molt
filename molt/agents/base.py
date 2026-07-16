@@ -268,6 +268,8 @@ class Runner(ABC):
         rollout_kind: str = "train",
         policy_version: int = 0,
         policy_frozen: bool = False,
+        rollout_group_id: str | None = None,
+        rollout_id: str | None = None,
     ) -> Trajectory:
         raise NotImplementedError
 
@@ -313,6 +315,8 @@ class StepEnvRunner(Runner):
         rollout_kind: str = "train",
         policy_version: int = 0,
         policy_frozen: bool = False,
+        rollout_group_id: str | None = None,
+        rollout_id: str | None = None,
     ):
         # tools are already rendered into the pre-rendered prompt (dataset chat template);
         # the kwarg exists only for Runner signature parity with the chat path.

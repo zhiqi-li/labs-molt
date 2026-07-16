@@ -356,6 +356,8 @@ async def _execute_runner_with_policy_audit(
     rollout_kind="train",
     policy_version=0,
     policy_frozen=False,
+    rollout_group_id=None,
+    rollout_id=None,
 ):
     """Execute one rollout and stamp scheduler-owned policy provenance.
 
@@ -379,6 +381,8 @@ async def _execute_runner_with_policy_audit(
         rollout_kind=rollout_kind,
         policy_version=start_version,
         policy_frozen=policy_frozen,
+        rollout_group_id=rollout_group_id,
+        rollout_id=rollout_id,
     )
 
     if version_source is not None:
@@ -499,6 +503,8 @@ class AgentRunnerActor:
         infrastructure_retries = _robolab_infrastructure_retries()
 
         async def execute_one(sibling_index):
+            rollout_id = uuid4().hex
+
             async def execute_attempt():
                 sibling_sampling_params = deepcopy(sampling_params)
                 if deterministic_rollouts:
@@ -524,10 +530,15 @@ class AgentRunnerActor:
                     rollout_kind=rollout_kind,
                     policy_version=policy_version,
                     policy_frozen=policy_frozen,
+                    rollout_group_id=group_id,
+                    rollout_id=rollout_id,
                 )
 
-            return await _retry_unsafe_robolab_worker(
-                execute_attempt, retries=infrastructure_retries
+            return (
+                await _retry_unsafe_robolab_worker(
+                    execute_attempt, retries=infrastructure_retries
+                ),
+                rollout_id,
             )
 
         tasks = [execute_one(sibling_index) for sibling_index in range(n_samples)]
@@ -536,8 +547,8 @@ class AgentRunnerActor:
             if isinstance(r, BaseException):
                 print(f"[runner] dropping failed rollout in group {group_id}: {r!r}", flush=True)
                 continue
-            rollout_id = uuid4().hex
-            for traj in r if isinstance(r, list) else [r]:
+            result, rollout_id = r
+            for traj in result if isinstance(result, list) else [result]:
                 traj.group_id, traj.rollout_id = group_id, rollout_id
                 flattened.append(traj)
         return flattened

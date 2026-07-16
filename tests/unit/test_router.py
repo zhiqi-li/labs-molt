@@ -367,11 +367,15 @@ def test_execute_runner_stamps_authoritative_policy_provenance(
             rollout_kind="eval",
             policy_version=policy_version,
             policy_frozen=policy_frozen,
+            rollout_group_id="group-before-execute",
+            rollout_id="rollout-before-execute",
         )
     )
 
     assert runner.kwargs["policy_version"] == expected_start
     assert runner.kwargs["rollout_kind"] == "eval"
+    assert runner.kwargs["rollout_group_id"] == "group-before-execute"
+    assert runner.kwargs["rollout_id"] == "rollout-before-execute"
     assert result[0].extra_logs == {
         "rollout_kind": "eval",
         "policy_version_start": expected_start,

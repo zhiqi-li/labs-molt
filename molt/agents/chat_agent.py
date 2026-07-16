@@ -110,6 +110,10 @@ class ChatContext:
     session_id: str  # raw id; rarely needed once base_url carries it
     sampling_params: Any
     max_length: int
+    # Scheduler-owned identities are allocated before any sibling begins.
+    # Environments must never recover these from a Trajectory stamped after run().
+    rollout_group_id: str
+    rollout_id: str
     rollout_kind: str = "train"
     # Scheduler policy version at dispatch. ``policy_frozen`` states whether
     # the generation lock guarantees that this version cannot change mid-run.
@@ -240,8 +244,14 @@ class ChatAgentRunner(Runner):
         rollout_kind: str = "train",
         policy_version: int = 0,
         policy_frozen: bool = False,
+        rollout_group_id: str | None = None,
+        rollout_id: str | None = None,
     ):
         await self._ensure_server(llm_engine, hf_tokenizer, max_length, sampling_params)
+        if not rollout_group_id or not rollout_id:
+            raise RuntimeError(
+                "ChatAgentRunner requires scheduler-allocated rollout_group_id and rollout_id"
+            )
         session_id = rollout_session_id(sampling_params)
         messages = _wire_messages(prompt, images)
         # Scalar view of the task for grading/logging (and Trajectory.prompt): the last user
@@ -266,6 +276,8 @@ class ChatAgentRunner(Runner):
             session_id=session_id,
             sampling_params=sampling_params,
             max_length=max_length,
+            rollout_group_id=rollout_group_id,
+            rollout_id=rollout_id,
             rollout_kind=rollout_kind,
             policy_version_start=int(policy_version),
             policy_frozen=bool(policy_frozen),
