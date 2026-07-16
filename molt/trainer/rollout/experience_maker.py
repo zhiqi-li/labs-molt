@@ -121,7 +121,13 @@ class RemoteExperienceMaker:
 
     def _dispatch_forward(self, group, sync_condition, **kwargs):
         """Dispatch a batched forward call and optionally sync + empty cache."""
-        ref = group.async_run_method_batch(method_name="forward", **kwargs)
+        # Multi-turn agents flatten one rollout into a variable number of
+        # segments, so the microbatch count is not generally divisible by the
+        # FSDP DP degree.  Read-only duplicate padding makes every rank enter
+        # the same number of all-gathers; actor_group omits the dummy results.
+        ref = group.async_run_method_batch(
+            method_name="forward", pad_to_divisible=True, **kwargs
+        )
         if sync_condition:
             ray.get(ref)
             ray.get(group.async_run_method(method_name="empty_cache"))
