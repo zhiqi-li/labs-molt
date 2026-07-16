@@ -280,6 +280,59 @@ class RouterGenerateClient:
         return SimpleNamespace(outputs=[gen], prompt_routed_experts=None), 0
 
 
+async def _execute_runner_with_policy_audit(
+    *,
+    runner,
+    version_source,
+    prompt,
+    label,
+    sampling_params,
+    max_length,
+    hf_tokenizer,
+    llm_engine,
+    images,
+    tools=None,
+    rollout_kind="train",
+    policy_version=0,
+    policy_frozen=False,
+):
+    """Execute a rollout and stamp scheduler-owned policy provenance."""
+    start_version = int(policy_version)
+    if version_source is not None:
+        start_version = int(await version_source.get_weight_version.remote())
+
+    result = await runner.execute(
+        prompt=prompt,
+        label=label,
+        sampling_params=sampling_params,
+        max_length=max_length,
+        hf_tokenizer=hf_tokenizer,
+        llm_engine=llm_engine,
+        images=images,
+        tools=tools,
+    )
+
+    if version_source is not None:
+        end_version = int(await version_source.get_weight_version.remote())
+        observed_frozen = start_version == end_version
+    elif policy_frozen:
+        end_version = start_version
+        observed_frozen = True
+    else:
+        end_version = -1
+        observed_frozen = False
+
+    for trajectory in result if isinstance(result, list) else [result]:
+        trajectory.extra_logs = dict(trajectory.extra_logs or {})
+        trajectory.extra_logs.update(
+            policy_version_start=start_version,
+            policy_version_end=end_version,
+            policy_frozen=float(observed_frozen),
+            rollout_kind=str(rollout_kind),
+        )
+    return result
+
+
 @ray.remote
 class AgentRunnerActor:
     """One rollout driver process: runs the user's agent runner against the router.
@@ -290,13 +343,14 @@ class AgentRunnerActor:
     (``--rollout.num_runners``) parallelizes that work; the trainer round-robins prompts
     across them (no pool wrapper — just a list + an index)."""
 
-    async def __init__(self, agent_path, router_url, *, model_path=None, model_name="policy"):
+    async def __init__(self, agent_path, router_url, *, model_path=None, model_name="policy", version_source=None):
         import aiohttp
 
         from molt.agents.base import load_agent_runner  # lazy: router.py is imported by _chat_server
         from molt.utils import get_tokenizer
 
         self._runner = load_agent_runner(agent_path)
+        self._version_source = version_source
         self._tokenizer = get_tokenizer(model_path, None) if model_path else None
         # VLM image placeholder id (from the HF processor) — the transport uses it to align render's
         # mm features onto our canonical prompt's image-token run (see _align_features_to_canonical).
@@ -316,13 +370,27 @@ class AgentRunnerActor:
     async def ready(self):
         return True
 
-    async def run_group(self, prompt, label, images, sampling_params, max_length, n_samples, tools=None):
+    async def run_group(
+        self,
+        prompt,
+        label,
+        images,
+        sampling_params,
+        max_length,
+        n_samples,
+        tools=None,
+        rollout_kind="train",
+        policy_version=0,
+        policy_frozen=False,
+    ):
         """N rollouts of one prompt (unchanged runner) -> flattened Trajectories, tagged
         group_id (per prompt; GRPO baseline) + rollout_id (per rollout; multi-turn
         step-samples share it). A failed rollout is dropped, never sinks the group."""
         group_id = uuid4().hex
         tasks = [
-            self._runner.execute(
+            _execute_runner_with_policy_audit(
+                runner=self._runner,
+                version_source=self._version_source,
                 prompt=prompt,
                 label=label,
                 sampling_params=deepcopy(sampling_params),
@@ -331,6 +399,9 @@ class AgentRunnerActor:
                 llm_engine=self._client,
                 images=images,
                 tools=tools,
+                rollout_kind=rollout_kind,
+                policy_version=policy_version,
+                policy_frozen=policy_frozen,
             )
             for _ in range(n_samples)
         ]
