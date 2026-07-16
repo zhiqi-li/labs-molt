@@ -321,6 +321,7 @@ class AgentRunnerActor:
         group_id (per prompt; GRPO baseline) + rollout_id (per rollout; multi-turn
         step-samples share it). A failed rollout is dropped, never sinks the group."""
         group_id = uuid4().hex
+        rollout_ids = [uuid4().hex for _ in range(n_samples)]
         tasks = [
             self._runner.execute(
                 prompt=prompt,
@@ -331,15 +332,19 @@ class AgentRunnerActor:
                 llm_engine=self._client,
                 images=images,
                 tools=tools,
+                rollout_group_id=group_id,
+                rollout_id=rollout_id,
             )
-            for _ in range(n_samples)
+            for rollout_id in rollout_ids
         ]
         flattened = []
-        for r in await asyncio.gather(*tasks, return_exceptions=True):  # a failed rollout must not sink the group
+        for rollout_id, r in zip(
+            rollout_ids,
+            await asyncio.gather(*tasks, return_exceptions=True),
+        ):
             if isinstance(r, BaseException):
                 print(f"[runner] dropping failed rollout in group {group_id}: {r!r}", flush=True)
                 continue
-            rollout_id = uuid4().hex
             for traj in r if isinstance(r, list) else [r]:
                 traj.group_id, traj.rollout_id = group_id, rollout_id
                 flattened.append(traj)
