@@ -275,6 +275,73 @@ def accumulate_mm_inputs(existing: Optional[Dict], new: Optional[Dict]) -> Optio
     return merged
 
 
+def make_mm_train_input_spec(mm_train_inputs: Dict) -> Dict:
+    """Build a small fail-closed fingerprint for image-only reconstruction.
+
+    Every value of small metadata tensors (for example Qwen's
+    ``image_grid_thw``) and representative values from large pixel tensors are
+    retained.  The result is tiny compared with the float32 patch payload but
+    detects a wrong processor, image order, resize policy, dtype, or layout.
+    """
+    spec = {}
+    for key, value in mm_train_inputs.items():
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Compact VLM transport requires tensor input {key!r}, got {type(value).__name__}")
+        flat = value.detach().to("cpu").contiguous().view(-1)
+        if flat.numel() <= 64:
+            indices = torch.arange(flat.numel(), dtype=torch.long)
+        elif flat.numel():
+            indices = torch.tensor(
+                sorted(
+                    {
+                        0,
+                        flat.numel() // 7,
+                        flat.numel() // 3,
+                        flat.numel() // 2,
+                        2 * flat.numel() // 3,
+                        6 * flat.numel() // 7,
+                        flat.numel() - 1,
+                    }
+                ),
+                dtype=torch.long,
+            )
+        else:
+            indices = torch.empty(0, dtype=torch.long)
+        spec[key] = {
+            "shape": tuple(value.shape),
+            "dtype": str(value.dtype),
+            "indices": indices,
+            "values": flat.index_select(0, indices).clone(),
+        }
+    return spec
+
+
+def rebuild_mm_train_inputs(processor, images, spec: Dict) -> Dict:
+    """Recreate image-derived processor tensors and verify their fingerprint."""
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        raise RuntimeError("Compact VLM transport requires a processor.image_processor")
+    rebuilt = dict(image_processor(images=images, return_tensors="pt"))
+    if set(rebuilt) != set(spec):
+        raise RuntimeError(
+            "Compact VLM transport rebuilt different keys: " f"expected={sorted(spec)}, actual={sorted(rebuilt)}"
+        )
+    for key, expected in spec.items():
+        value = rebuilt[key]
+        if not isinstance(value, torch.Tensor):
+            raise RuntimeError(f"Rebuilt VLM input {key!r} is not a tensor: {type(value).__name__}")
+        if tuple(value.shape) != tuple(expected["shape"]) or str(value.dtype) != expected["dtype"]:
+            raise RuntimeError(
+                f"Compact VLM transport mismatch for {key}: expected shape={expected['shape']} "
+                f"dtype={expected['dtype']}, actual shape={tuple(value.shape)} dtype={value.dtype}"
+            )
+        indices = expected["indices"]
+        actual_values = value.detach().to("cpu").contiguous().view(-1).index_select(0, indices)
+        if not torch.equal(actual_values, expected["values"]):
+            raise RuntimeError(f"Compact VLM transport fingerprint mismatch for {key}")
+    return rebuilt
+
+
 def merge_mm_train_inputs(mm_train_inputs_list: list, device) -> Dict[str, torch.Tensor]:
     """Merge per-sample multimodal tensor dicts into one batched dict on *device*.
 

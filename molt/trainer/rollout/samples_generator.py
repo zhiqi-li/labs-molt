@@ -18,6 +18,7 @@
 
 import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -29,8 +30,67 @@ from vllm import SamplingParams
 from molt.agents.base import _first_scalar as _to_scalar  # dedupe: same tensor/list/scalar normalizer
 from molt.trainer.algorithm.experience import Experience
 from molt.utils.logging_utils import init_logger
+from molt.utils.vlm_utils import make_mm_train_input_spec
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class EvalExperience:
+    """Scalar-only eval record that cannot pin rollout tensors in Ray plasma."""
+
+    prompts: list = field(default_factory=list)
+    group_ids: list = field(default_factory=list)
+    rollout_ids: list = field(default_factory=list)
+    rewards: list = field(default_factory=list)
+    response_length: list = field(default_factory=list)
+    truncated: list = field(default_factory=list)
+    info: dict = field(default_factory=dict)
+
+
+def _eval_scalar(value):
+    """Detach one numeric value from tensor/list storage for eval aggregation."""
+    value = _to_scalar(value)
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (bool, int, float)):
+        return value
+    return None
+
+
+def _compact_eval_experience(sample) -> EvalExperience:
+    """Keep only fields consumed by ``compute_eval_metrics``.
+
+    Multi-turn Experiences retain token, logprob, mask, and VLM tensors. Keeping
+    an entire eval set therefore pins hundreds of GiB of zero-copy Ray objects.
+    Converting the terminal statistics to Python scalars lets the source object
+    be released as soon as each rollout is collected; training Experiences are
+    intentionally untouched.
+    """
+
+    def first_item(name):
+        values = getattr(sample, name, None) or []
+        return [values[0]] if values else []
+
+    def scalar_list(name):
+        value = _eval_scalar(getattr(sample, name, None))
+        return [] if value is None else [value]
+
+    compact_info = {}
+    for name, value in (getattr(sample, "info", None) or {}).items():
+        scalar = _eval_scalar(value)
+        if scalar is not None:
+            compact_info[name] = scalar
+
+    return EvalExperience(
+        prompts=first_item("prompts"),
+        group_ids=first_item("group_ids"),
+        rollout_ids=first_item("rollout_ids"),
+        rewards=scalar_list("rewards"),
+        response_length=scalar_list("response_length"),
+        truncated=scalar_list("truncated"),
+        info=compact_info,
+    )
 
 
 def _collect_prompt_batch(dataloader_iter, num_prompts: int):
@@ -148,28 +208,52 @@ class SamplesGenerator:
             logger.warning(f"warm-resume: load skipped ({e})")
 
     @torch.no_grad()
-    def generate_eval_samples(self, **generate_kwargs) -> List[Experience]:
-        """Generate evaluation samples for the entire eval dataloader."""
+    def generate_eval_samples(self, **generate_kwargs) -> List[EvalExperience]:
+        """Generate the entire eval set into scalar-only records with a bounded pool."""
         if getattr(self, "_eval_dataloader_iter", None) is None:
             self._eval_dataloader_iter = iter(self.eval_dataloader)
 
-        all_experiences: List[Experience] = []
+        all_experiences: List[EvalExperience] = []
         eval_batch_size = getattr(self.args.eval, "batch_size", None) or self.args.rollout.batch_size
         if eval_batch_size <= 0:
             raise ValueError(f"eval.batch_size must be positive, got {eval_batch_size}")
+        pending_refs: List = []
+        exhausted = False
+        drop_counts: Dict[str, int] = defaultdict(int)
+        progress = tqdm(desc="Generate eval samples")
         try:
-            while True:
-                experiences, _, exhausted = self._generate_batch(
-                    dataloader_iter=self._eval_dataloader_iter,
-                    num_prompts=eval_batch_size,
-                    dynamic_filtering=False,
-                    **generate_kwargs,
-                )
-                all_experiences.extend(experiences)
-                if exhausted:
+            while not exhausted or pending_refs:
+                free_slots = eval_batch_size - len(pending_refs)
+                if free_slots > 0 and not exhausted:
+                    prompts, labels, images, tools, exhausted = _collect_prompt_batch(
+                        self._eval_dataloader_iter, free_slots
+                    )
+                    if prompts:
+                        pending_refs.extend(
+                            self._dispatch_to_agent_runners(
+                                prompts, labels, images=images, tools=tools, **generate_kwargs
+                            )
+                        )
+
+                if not pending_refs:
                     break
+
+                # Do not prefetch every pending result into this actor's object
+                # store. Fetch exactly the one completed rollout selected below,
+                # compact it to scalars, then release its large Ray tensors.
+                ready_refs, pending_refs = ray.wait(pending_refs, num_returns=1, timeout=10.0, fetch_local=False)
+                for ref in ready_refs:
+                    all_experiences.extend(
+                        _compact_eval_experience(sample)
+                        for sample in self._filter_group(ref, False, drop_counts, **generate_kwargs)
+                    )
+                    progress.update(1)
         finally:
+            progress.close()
             self._eval_dataloader_iter = None
+
+        if drop_counts:
+            logger.info(f"Eval rollout drops: {dict(drop_counts)}")
 
         return all_experiences
 
@@ -581,6 +665,15 @@ class SamplesGenerator:
                 arr = np.stack(rows).astype(np.int16)[:truncate_length]  # (T, L, K), aligned with sequences
                 routed_experts = torch.from_numpy(arr).permute(1, 2, 0).contiguous().unsqueeze(0)  # (1, L, K, T)
 
+        compact_mm_transport = (
+            os.environ.get("MOLT_COMPACT_VLM_EXPERIENCE", "0") == "1"
+            and response.mm_train_inputs is not None
+            and bool(response.pil_images)
+        )
+        if compact_mm_transport and not hasattr(self.tokenizer, "image_processor"):
+            raise RuntimeError("MOLT_COMPACT_VLM_EXPERIENCE=1 requires a processor.image_processor")
+        mm_train_input_specs = [make_mm_train_input_spec(response.mm_train_inputs)] if compact_mm_transport else []
+
         experience = Experience(
             sequences=sequences.unsqueeze(0),
             attention_mask=attention_mask.unsqueeze(0),
@@ -589,8 +682,14 @@ class SamplesGenerator:
             routed_experts=routed_experts,
             prompts=[response.prompt],
             labels=[response.label],
-            images=[response.images],
-            mm_train_inputs=[response.mm_train_inputs],
+            # Compact mode carries the lossless PIL observations instead of
+            # enormous float32 patch tensors across the generator->trainer Ray
+            # queue. The trainer reconstructs and fingerprints the exact
+            # processor outputs before any forward. Default mode preserves the
+            # existing preprocessed payload and drops the unused raw copy.
+            images=[list(response.pil_images)] if compact_mm_transport else [],
+            mm_train_inputs=[] if compact_mm_transport else [response.mm_train_inputs],
+            mm_train_input_specs=mm_train_input_specs,
             group_ids=[response.group_id] if response.group_id is not None else [],
             rollout_ids=[response.rollout_id] if response.rollout_id is not None else [],
             rewards=torch.tensor([reward_val]) if reward_val is not None else None,
