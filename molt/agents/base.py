@@ -35,6 +35,7 @@ step-return tuple — used by both the per-step `Env.step()` and the one-shot
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -46,6 +47,14 @@ import torch
 from molt.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def rollout_session_id(sampling_params) -> str:
+    """Return stable engine affinity when a request-level seed exists."""
+    seed = getattr(sampling_params, "seed", None)
+    if seed is None:
+        return uuid4().hex
+    return hashlib.sha256(f"molt-rollout-session:{int(seed)}".encode()).hexdigest()
 
 
 def _first_scalar(value):
@@ -298,7 +307,7 @@ class StepEnvRunner(Runner):
         # One session id for the whole rollout: consistent_hash routes every turn (and each turn's
         # render + generate) to ONE engine, so the multi-turn KV prefix stays warm and a VLM turn's
         # render features resolve where it generates. Per-rollout, like vime/slime.
-        rollout_sid = uuid4().hex
+        rollout_sid = rollout_session_id(sampling_params)
 
         reset = await env.reset({"observation": prompt, "label": label})
         observation_text = reset["observation"]
