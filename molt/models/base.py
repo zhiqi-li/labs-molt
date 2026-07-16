@@ -43,6 +43,16 @@ from .utils import (
 )
 
 
+def _dense_hf_forward_autocast_dtype(*, use_hf_model: bool, compute_dtype: torch.dtype):
+    """Resolve the opt-in legacy autocast path for dense HF fallback models."""
+    value = os.environ.get("MOLT_DENSE_HF_FORWARD_AUTOCAST", "0").strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        return None
+    if value not in {"1", "true", "yes", "on"}:
+        raise ValueError(f"invalid MOLT_DENSE_HF_FORWARD_AUTOCAST={value!r}")
+    return compute_dtype if use_hf_model and compute_dtype != torch.float32 else None
+
+
 def _detect_moe_arch(pretrain_or_model) -> bool:
     """Lightweight MoE detection from HF config (no model load)."""
     if not isinstance(pretrain_or_model, str):
@@ -305,6 +315,10 @@ class BaseModel(nn.Module):
         if is_moe and not ep_active:
             raise ValueError("MoE models require --fsdp.ep_size > 1 in the AutoModel custom-only branch.")
         use_hf_model = _will_use_hf_model(pretrain_or_model)
+        self._forward_autocast_dtype = _dense_hf_forward_autocast_dtype(
+            use_hf_model=use_hf_model,
+            compute_dtype=compute_dtype,
+        )
         # EP dispatch is a nemo_automodel custom-path feature; HF has no equivalent. An
         # HF-fallback model under active EP would silently mis-shard experts / train on
         # wrong grads, so forbid it loudly. (TP/CP run on HF, so they aren't gated here.)
@@ -717,11 +731,17 @@ class BaseModel(nn.Module):
                     sequences = cp_batch["input_ids"]
                 cp_forward = True
 
-        # No forward-level torch.autocast: FSDP2's MixedPrecisionPolicy already
+        # No forward-level torch.autocast by default: FSDP2's MixedPrecisionPolicy already
         # casts managed params to bf16 for the forward, and an extra autocast would
         # force the fp32-kept MoE gate (gate_precision float32) into bf16 — its
         # degraded scores flip top-k routing vs the engine's fp32 router and inflate
-        # vllm_kl on routing-sensitive MoE checkpoints.
+        # vllm_kl on routing-sensitive MoE checkpoints. Dense HF fallback can opt in.
+        autocast_dtype = getattr(self, "_forward_autocast_dtype", None)
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=autocast_dtype)
+            if autocast_dtype is not None and sequences.is_cuda
+            else nullcontext()
+        )
         forward_ctx = cp_ctx_factory()
         if cp_context_stack is not None and cp_forward:
             # AutoModel CP train context installs backward hooks, so training
@@ -744,7 +764,7 @@ class BaseModel(nn.Module):
                 cp_context_stack.enter_context(replay_ctx)
                 replay_ctx = nullcontext()
 
-        with forward_ctx:
+        with forward_ctx, autocast_ctx:
             # Always pass sequences as keyword `input_ids`: some VLM forwards
             # declare `pixel_values` first positional, so a bare positional would
             # collide with it. In the pre-embed CP path we pass inputs_embeds
