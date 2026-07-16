@@ -832,6 +832,9 @@ class PolicyModelActor(BaseModelActor):
             self.actor,
             self.tokenizer,
             args.ckpt.output_dir,
+            # The driver waits for every Ray actor future, so the post-promotion
+            # process-group barrier is redundant and can strand terminal jobs.
+            synchronize_after_promotion=False,
         )
 
     def forward(
