@@ -367,6 +367,8 @@ class StepEnvRunner(Runner):
             turn_sp.max_tokens = min(per_turn_cap, remaining) if per_turn_cap is not None else remaining
             if turn_sp.max_tokens <= 0:
                 trajectory.truncated = True
+                trajectory.extra_logs = dict(trajectory.extra_logs or {})
+                trajectory.extra_logs["generation_truncated"] = True
                 break
             # A late turn's remaining budget can drop below a configured min_tokens;
             # vLLM only validates min<=max at construction, not on reassignment.
@@ -406,7 +408,11 @@ class StepEnvRunner(Runner):
 
             trajectory.reward += reward_val
             trajectory.scores = score_val
-            trajectory.extra_logs = result.info or {}
+            trajectory.extra_logs = dict(result.info or {})
+            # Preserve the generation/context cutoff before folding in the
+            # environment-level Result.truncated flag below. Eval reporting
+            # needs both signals; training keeps the combined trajectory flag.
+            trajectory.extra_logs["generation_truncated"] = bool(trajectory.truncated)
 
             action_logprobs = None
             if trajectory.rollout_log_probs is not None:

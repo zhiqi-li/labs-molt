@@ -605,6 +605,13 @@ class SamplesGenerator:
             value = _to_scalar(value)
             if isinstance(value, (int, float, bool)):
                 info[key] = torch.tensor([value])
+        if "generation_truncated" in info:
+            # Post-tokenization clipping is another generation/context cutoff.
+            # Fold it into the explicit signal without conflating a terminal
+            # environment horizon carried by response.truncated.
+            info["generation_truncated"] = torch.tensor(
+                [bool(_to_scalar(info["generation_truncated"])) or bool(is_clipped)]
+            )
 
         # R3: per-token rollout routing aligned with `sequences` (one [L, K] expert-id
         # row per token), seq last after the permute below.
@@ -639,7 +646,7 @@ class SamplesGenerator:
             rewards=torch.tensor([reward_val]) if reward_val is not None else None,
             scores=torch.tensor([score_val]) if score_val is not None else None,
             response_length=torch.tensor([response_length]),
-            truncated=torch.tensor([response.truncated]),
+            truncated=torch.tensor([bool(response.truncated) or bool(is_clipped)]),
             total_length=torch.tensor([total_length]),
             info=info,
         )

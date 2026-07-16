@@ -214,17 +214,28 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         length = _first_scalar(s.response_length)
         if length is not None:
             grouped[key]["lengths"][rollout_id] = grouped[key]["lengths"].get(rollout_id, 0.0) + length
-        truncated = _first_scalar(s.truncated)
+        sample_info = getattr(s, "info", None) or {}
+        # Chat agents expose the generation/context cutoff explicitly because
+        # Experience.truncated also includes a terminal environment horizon.
+        # Preserve the legacy fallback for agents that do not emit the new
+        # signal, while keeping eval_truncated_rate generation-specific when it
+        # is available. The terminal info["truncated"] aggregate remains a
+        # separate eval_truncated metric.
+        generation_truncated = sample_info.get("generation_truncated")
+        truncated = _first_scalar(
+            s.truncated if generation_truncated is None else generation_truncated
+        )
         if truncated is not None:
             grouped[key]["truncated"][rollout_id] = max(grouped[key]["truncated"].get(rollout_id, 0.0), truncated)
-        sample_info = getattr(s, "info", None) or {}
         for metric_name, metric_value in sample_info.items():
             scalar = _first_scalar(metric_value)
             if isinstance(scalar, (int, float, bool)):
                 scalar = float(scalar)
                 raw_info.setdefault(metric_name, []).append(scalar)
                 by_rollout = rollout_info.setdefault(metric_name, {})
-                if metric_name == "response_clip_ratio" or metric_name.endswith("_backend_error"):
+                if metric_name in {"response_clip_ratio", "generation_truncated"} or metric_name.endswith(
+                    "_backend_error"
+                ):
                     # These flags may be segment-local. A single affected segment
                     # makes the terminal rollout affected.
                     by_rollout[rollout_id] = max(by_rollout.get(rollout_id, 0.0), scalar)

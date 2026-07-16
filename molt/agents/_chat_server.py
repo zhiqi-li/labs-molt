@@ -395,6 +395,11 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
     # the same way).
     remaining = state.max_length - len(prompt_ids) - image_budget
     if remaining <= 0:
+        # Preserve a later-turn context exhaustion on the rollout evidence.
+        # With no prior step the rollout remains empty and the eval cardinality
+        # guard fails closed, as before.
+        if session.steps:
+            session.steps[-1].truncated = True
         session.last_messages, session.last_response = messages, ("", "length")
         return "", "length"
     if sp.max_tokens is None or sp.max_tokens > remaining:
@@ -517,7 +522,12 @@ def stitch_session(state: ChatServerState, session_id: str, result):
     for traj in segments:
         traj.reward = result.reward
         traj.scores = result.score if result.score is not None else result.reward
-        traj.extra_logs = result.info or {}
+        traj.extra_logs = dict(result.info or {})
+        # Keep the model-generation/context cutoff separate from the terminal
+        # environment outcome. ``Trajectory.truncated`` still preserves the
+        # Gymnasium-style union below, while eval integrity can independently
+        # distinguish a provider length cutoff from an action-budget horizon.
+        traj.extra_logs["generation_truncated"] = bool(traj.truncated)
         # Environment-level horizons (for example a VLN action budget) are
         # independent from a model generation ending with finish_reason=length.
         traj.truncated = traj.truncated or bool(result.truncated)
