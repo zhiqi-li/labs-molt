@@ -433,7 +433,12 @@ class BaseRLTrainer:
         # global_token_count all-reduce and FSDP reduce-scatter) -> NCCL hang.
         # Multi-turn agents (variable step-samples per rollout) and rollout counts
         # not divisible by the DP degree both break this invariant without re-balance.
+        pre_balance_samples = sum(len(exp.sequences) for exp in experiences)
         experiences = balance_experiences(experiences, self.args)
+        post_balance_samples = sum(len(exp.sequences) for exp in experiences)
+        rollout_stats["rollout/dp_balance_dropped_samples"] = float(
+            pre_balance_samples - post_balance_samples
+        )
 
         # Push experiences to actor shards (and the critic, which trains on the same
         # batch with values + returns) before optimization.

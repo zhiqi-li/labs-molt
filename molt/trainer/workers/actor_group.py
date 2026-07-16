@@ -312,6 +312,11 @@ class RayActorGroup:
         Returns:
             List[ray.ObjectRef]: List of remote object references to the results
         """
+        if pad_to_divisible and method_name != "forward":
+            raise ValueError(
+                "pad_to_divisible is restricted to the read-only forward method"
+            )
+
         # Check if all kwargs parameters are iterable
         for key, value in kwargs.items():
             if not hasattr(value, "__len__"):
@@ -362,7 +367,7 @@ class RayActorGroup:
             dispatch_length += padding
             base_chunk_size = dispatch_length // effective_actors
             logging.getLogger(__name__).warning(
-                "async_run_method_batch: padding %s read-only %s forward(s) "
+                "async_run_method_batch: padding %s dummy invocation(s) for read-only %s "
                 "for %s-way DP collective alignment (%s -> %s)",
                 padding,
                 method_name,
