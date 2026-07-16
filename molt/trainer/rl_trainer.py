@@ -167,7 +167,14 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
             group_prompt[key] = prompt
         grouped[key]["rewards"].append(_first_scalar(s.rewards))
         grouped[key]["lengths"].append(_first_scalar(s.response_length))
-        grouped[key]["truncated"].append(_first_scalar(s.truncated))
+        sample_info = getattr(s, "info", None) or {}
+        # Chat agents expose generation/context cutoff independently from an
+        # environment horizon. Fall back to the combined legacy flag for other
+        # runners that do not yet emit the explicit signal.
+        generation_truncated = sample_info.get("generation_truncated")
+        grouped[key]["truncated"].append(
+            _first_scalar(s.truncated if generation_truncated is None else generation_truncated)
+        )
 
     metrics = {}
     for key in group_order:

@@ -352,6 +352,27 @@ def test_run_turn_ends_truncated_on_context_overflow(monkeypatch):
     assert state.sessions["sid"].trajectories == [] and tp.calls == []
 
 
+def test_later_context_overflow_survives_stitch_with_episode_truncation(monkeypatch):
+    _patch_prompts(monkeypatch, [[1, 2], list(range(10))])
+    state, tp = _state([_act([90], [-0.1])], max_length=10)
+    state.open("sid", "P", "l", None)
+    session = state.sessions["sid"]
+
+    asyncio.run(_run_turn(state, session, _MSG))
+    action, finish = asyncio.run(_run_turn(state, session, {"messages": [{"role": "user", "content": "full"}]}))
+    out = stitch_session(
+        state,
+        "sid",
+        Result(reward=0.0, truncated=True, info={"truncated": True}),
+    )
+
+    assert (action, finish) == ("", "length")
+    assert len(tp.calls) == 1 and len(out) == 1
+    assert out[0].truncated is True
+    assert out[0].extra_logs["generation_truncated"] is True
+    assert out[0].extra_logs["truncated"] is True
+
+
 def test_run_turn_marks_truncated_on_length_finish(monkeypatch):
     _patch_prompts(monkeypatch, [[1]])
     state, _ = _state([_act([90, 91], [-0.1, -0.2], finish="length")])
@@ -495,6 +516,22 @@ def test_stitch_returns_one_trajectory_stamped_with_reward():
     assert len(out) == 1
     assert len(out[0].action_ranges) == 2  # both turns on the one trajectory
     assert out[0].reward == 1.0 and out[0].scores == 0.5
+
+
+def test_stitch_propagates_environment_truncation_to_trajectory():
+    engine = _DriftyEngine([_dact(_ids("A1"), [-0.1, -0.1]), _dact(_ids("A2"), [-0.2, -0.2])])
+    state = ChatServerState(engine, _DriftyProc(), "policy", 10000, _sampling())
+    state.open("sid", "P", "l", None)
+    session = state.sessions["sid"]
+    msgs = [{"role": "user", "content": "Q0"}]
+    act1, _ = _drive(state, session, msgs)
+    _drive(state, session, msgs + [{"role": "assistant", "content": act1}, {"role": "user", "content": "OBS1"}])
+
+    out = stitch_session(state, "sid", Result(reward=0.0, truncated=True))
+
+    assert len(out) == 1
+    assert out[0].truncated is True
+    assert out[0].extra_logs["generation_truncated"] is False
 
 
 # ---------------------------------------------------------------------------

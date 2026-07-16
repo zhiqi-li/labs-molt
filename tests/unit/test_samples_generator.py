@@ -251,6 +251,53 @@ def test_process_response_counts_only_action_tokens_for_multiturn_lengths():
     )
 
 
+def test_process_response_keeps_generation_truncation_separate_from_episode_horizon():
+    generator = object.__new__(SamplesGenerator)
+
+    episode_only, drop_reason = generator._process_response_into_experience(
+        Trajectory(
+            prompt="p",
+            label="l",
+            images=None,
+            observation_text="",
+            observation_tokens=[0, 1, 2],
+            action_ranges=[(1, 3)],
+            rollout_log_probs=[0.0, 0.0, 0.0],
+            reward=0.0,
+            scores=0.0,
+            truncated=True,
+            extra_logs={"generation_truncated": False, "truncated": True},
+        ),
+        max_len=8,
+    )
+
+    assert drop_reason is None
+    assert episode_only.truncated.item() is True
+    assert episode_only.info["generation_truncated"].item() is False
+    assert episode_only.info["truncated"].item() is True
+
+    clipped, drop_reason = generator._process_response_into_experience(
+        Trajectory(
+            prompt="p",
+            label="l",
+            images=None,
+            observation_text="",
+            observation_tokens=[0, 1, 2, 3, 4, 5],
+            action_ranges=[(1, 6)],
+            rollout_log_probs=[0.0] * 6,
+            reward=0.0,
+            scores=0.0,
+            extra_logs={"generation_truncated": False, "truncated": False},
+        ),
+        max_len=4,
+    )
+
+    assert drop_reason is None
+    assert clipped.truncated.item() is True
+    assert clipped.info["generation_truncated"].item() is True
+    assert clipped.info["truncated"].item() is False
+
+
 def test_process_response_rejects_action_ranges_outside_trajectory():
     generator = object.__new__(SamplesGenerator)
 
