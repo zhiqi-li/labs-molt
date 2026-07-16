@@ -41,6 +41,7 @@ through the URL path prefix ``/s/<session_id>/v1`` that ``ChatAgentRunner`` buil
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -245,7 +246,27 @@ def _messages_to_chat(state: ChatServerState, messages: list) -> tuple[list, lis
     chat, pil_images = [], []
     for m in messages:
         text, imgs = _content_to_text_and_images(m.get("content"))
-        chat.append({"role": m.get("role"), "content": text})
+        rendered = {"role": m.get("role"), "content": text}
+        for key in ("tool_call_id", "name", "reasoning_content", "function_call"):
+            if key in m:
+                rendered[key] = m[key]
+        if m.get("tool_calls"):
+            tool_calls = deepcopy(m["tool_calls"])
+            for tool_call in tool_calls:
+                function = tool_call.get("function") if isinstance(tool_call, dict) else None
+                if not isinstance(function, dict):
+                    continue
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        arguments = json.loads(arguments)
+                    except json.JSONDecodeError as error:
+                        raise ValueError("Chat tool call has invalid JSON function.arguments") from error
+                    if not isinstance(arguments, dict):
+                        raise ValueError("Chat tool call function.arguments must decode to a JSON object")
+                    function["arguments"] = arguments
+            rendered["tool_calls"] = tool_calls
+        chat.append(rendered)
         pil_images.extend(imgs)
     if state.expand_image_placeholder:
         chat = [split_image_placeholder(m) for m in chat]
@@ -265,7 +286,9 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
     if messages == session.last_messages:  # retry of an already-recorded turn -> replay, don't re-record
         return session.last_response
     sp = _build_sampling_params(session.sampling_params or state.default_sampling, body)
-    kwargs = {"tools": body["tools"]} if body.get("tools") else {}
+    kwargs = dict(body.get("chat_template_kwargs") or {})
+    if body.get("tools"):
+        kwargs["tools"] = body["tools"]
     loop = asyncio.get_running_loop()
 
     # Does this turn continue the running segment, or did the agent rewrite/shorten the history
