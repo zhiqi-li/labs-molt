@@ -638,6 +638,7 @@ def test_dispatch_forwards_rollout_and_policy_metadata():
     actor = SimpleNamespace(run_group=RemoteRunGroup())
     generator = object.__new__(SamplesGenerator)
     generator.args = SimpleNamespace(
+        train=SimpleNamespace(seed=1234),
         rollout=SimpleNamespace(n_samples_per_prompt=4),
         algo=SimpleNamespace(advantage=SimpleNamespace(is_correction_level="off")),
     )
@@ -661,3 +662,4 @@ def test_dispatch_forwards_rollout_and_policy_metadata():
     assert args[4:] == (128, 4)
     assert kwargs["tools"] is None
     assert (kwargs["rollout_kind"], kwargs["policy_version"], kwargs["policy_frozen"]) == ("eval", 17, True)
+    assert kwargs["base_seed"] == 1234
