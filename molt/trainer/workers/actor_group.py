@@ -115,6 +115,13 @@ class BaseModelActor(BaseDistributedActor):
             if len(param_value) != list_length:
                 raise ValueError(f"Parameter {param_name} has length {len(param_value)}, expected {list_length}")
 
+        if valid_result_count is None:
+            valid_result_count = list_length
+        if not 0 <= valid_result_count <= list_length:
+            raise ValueError(
+                f"valid_result_count={valid_result_count} is outside [0, {list_length}]"
+            )
+
         # Get the function to execute
         func = getattr(self, method_name)
         if not callable(func):
@@ -126,15 +133,10 @@ class BaseModelActor(BaseDistributedActor):
             sample_kwargs = {param_name: param_value[i] for param_name, param_value in kwargs.items()}
 
             result = func(**sample_kwargs)
-            results.append(result)
+            if i < valid_result_count:
+                results.append(result)
 
-        if valid_result_count is None:
-            return results
-        if not 0 <= valid_result_count <= len(results):
-            raise ValueError(
-                f"valid_result_count={valid_result_count} is outside [0, {len(results)}]"
-            )
-        return results[:valid_result_count]
+        return results
 
 
 @ray.remote(num_gpus=1)
