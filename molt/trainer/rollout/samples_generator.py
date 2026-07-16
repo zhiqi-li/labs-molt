@@ -30,6 +30,7 @@ from vllm import SamplingParams
 from molt.agents.base import _first_scalar as _to_scalar  # dedupe: same tensor/list/scalar normalizer
 from molt.trainer.algorithm.experience import Experience
 from molt.utils.logging_utils import init_logger
+from molt.utils.vlm_utils import make_mm_train_input_spec
 
 logger = init_logger(__name__)
 
@@ -720,6 +721,17 @@ class SamplesGenerator:
                 arr = np.stack(rows).astype(np.int16)[:truncate_length]  # (T, L, K), aligned with sequences
                 routed_experts = torch.from_numpy(arr).permute(1, 2, 0).contiguous().unsqueeze(0)  # (1, L, K, T)
 
+        compact_mm_transport = (
+            os.environ.get("MOLT_COMPACT_VLM_EXPERIENCE", "0") == "1"
+            and response.mm_train_inputs is not None
+            and bool(response.pil_images)
+        )
+        if compact_mm_transport and not hasattr(self.tokenizer, "image_processor"):
+            raise RuntimeError("MOLT_COMPACT_VLM_EXPERIENCE=1 requires a processor.image_processor")
+        mm_train_input_specs = (
+            [make_mm_train_input_spec(response.mm_train_inputs)] if compact_mm_transport else []
+        )
+
         experience = Experience(
             sequences=sequences.unsqueeze(0),
             attention_mask=attention_mask.unsqueeze(0),
@@ -728,13 +740,14 @@ class SamplesGenerator:
             routed_experts=routed_experts,
             prompts=[response.prompt],
             labels=[response.label],
-            # ``mm_train_inputs`` is the canonical multimodal payload consumed by
-            # every actor/reference forward.  Keeping the original PIL/image list
-            # as well duplicates tens of GiB for long embodied rollouts, and the
-            # training stack never reads ``Experience.images`` after preprocessing.
-            # Drop that transport-only copy before the Experience crosses Ray.
-            images=[],
-            mm_train_inputs=[response.mm_train_inputs],
+            # Compact mode carries the lossless PIL observations instead of
+            # enormous float32 patch tensors across the generator->trainer Ray
+            # queue. The trainer reconstructs and fingerprints the exact
+            # processor outputs before any forward. Default mode preserves the
+            # existing preprocessed payload and drops the unused raw copy.
+            images=[list(response.pil_images)] if compact_mm_transport else [],
+            mm_train_inputs=[] if compact_mm_transport else [response.mm_train_inputs],
+            mm_train_input_specs=mm_train_input_specs,
             group_ids=[response.group_id] if response.group_id is not None else [],
             rollout_ids=[response.rollout_id] if response.rollout_id is not None else [],
             rewards=torch.tensor([reward_val]) if reward_val is not None else None,

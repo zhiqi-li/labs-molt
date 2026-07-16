@@ -45,8 +45,10 @@ def _ray_runtime_env_vars(environment=None):
         "VLLM_CACHE_ROOT",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "MOLT_DEFER_GRAD_SYNC",
+        "MOLT_COMPACT_VLM_EXPERIENCE",
         "MOLT_DENSE_HF_FORWARD_AUTOCAST",
         "MOLT_DETERMINISTIC_ROLLOUTS",
+        "MOLT_VLM_REPROCESS_WORKERS",
     ):
         if environment.get(name):
             env_vars[name] = environment[name]

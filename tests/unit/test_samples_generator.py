@@ -427,6 +427,41 @@ def test_process_response_drops_raw_images_after_multimodal_preprocessing():
     assert drop_reason is None
     assert experience.images == []
     assert experience.mm_train_inputs == [mm_train_inputs]
+    assert experience.mm_train_input_specs == []
+
+
+def test_process_response_compacts_vlm_payload_to_lossless_images(monkeypatch):
+    monkeypatch.setenv("MOLT_COMPACT_VLM_EXPERIENCE", "1")
+    generator = object.__new__(SamplesGenerator)
+    generator.tokenizer = SimpleNamespace(image_processor=object())
+    mm_train_inputs = {
+        "pixel_values": torch.arange(24, dtype=torch.float32).reshape(2, 12),
+        "image_grid_thw": torch.tensor([[1, 2, 3], [1, 4, 5]]),
+    }
+    pil_images = [object(), object()]
+
+    experience, drop_reason = generator._process_response_into_experience(
+        Trajectory(
+            prompt="p",
+            label="l",
+            images=["source-ref"],
+            observation_text="",
+            observation_tokens=[0, 1, 2],
+            action_ranges=[(1, 3)],
+            rollout_log_probs=[0.0, 0.0, 0.0],
+            reward=1.0,
+            scores=1.0,
+            mm_train_inputs=mm_train_inputs,
+            pil_images=pil_images,
+        ),
+        max_len=8,
+    )
+
+    assert drop_reason is None
+    assert experience.images == [pil_images]
+    assert experience.mm_train_inputs == []
+    assert len(experience.mm_train_input_specs) == 1
+    assert set(experience.mm_train_input_specs[0]) == set(mm_train_inputs)
 
 
 def test_process_response_keeps_generation_truncation_separate_from_episode_horizon():
