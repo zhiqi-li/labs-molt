@@ -191,6 +191,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data.output_key", type=str, default=None, help="Dataset column holding the assistant reply (SFT target)."
     )
+    parser.add_argument(
+        "--data.tools_key",
+        type=str,
+        default=None,
+        help="Dataset column holding per-sample OpenAI tool definitions rendered by the chat template.",
+    )
     parser.add_argument("--data.tokenizer_chat_template", type=str, default=None)
     parser.add_argument(
         "--data.train_on_last_turn_only",

@@ -18,6 +18,7 @@
 
 import json
 import os
+from copy import deepcopy
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -184,6 +185,7 @@ class SFTDataset(Dataset):
         data_cfg = strategy.args.data
         self.input_key = data_cfg.input_key
         self.output_key = data_cfg.output_key
+        self.tools_key = getattr(data_cfg, "tools_key", None)
         self._maybe_override_chat_template(getattr(data_cfg, "tokenizer_chat_template", None))
 
         # Assistant-reply span markers, discovered from the (possibly overridden) chat
@@ -215,15 +217,44 @@ class SFTDataset(Dataset):
     # ------------------------------------------------------------------
     def _build_row(self, row) -> dict:
         images = row.get(self.image_key) if self.image_key else None
+        tools = row.get(self.tools_key) if self.tools_key else None
         if images is not None and not isinstance(images, list):
             images = [images]
         if images is not None and len(images) > self.max_images_per_prompt:
-            return {"conversation": None, "images": None}  # dropped by .filter below
+            return {"conversation": None, "images": None, "tools": None}  # dropped by .filter below
 
         messages = self._to_messages(row)
         if messages is None:
-            return {"conversation": None, "images": None}
-        return {"conversation": json.dumps(messages), "images": images if self.image_key else None}
+            return {"conversation": None, "images": None, "tools": None}
+        return {
+            "conversation": json.dumps(messages),
+            "images": images if self.image_key else None,
+            # Keep nested schemas out of Arrow feature inference. Different tools
+            # can legitimately have different JSON-schema shapes.
+            "tools": json.dumps(tools) if tools else None,
+        }
+
+    @staticmethod
+    def _normalize_openai_tool_calls(message: dict) -> dict:
+        """Convert OpenAI-wire JSON argument strings for tokenizer templates."""
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            return message
+        normalized = deepcopy(message)
+        for call in normalized["tool_calls"]:
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as error:
+                    raise ValueError("SFT tool call has invalid JSON function.arguments") from error
+                if not isinstance(arguments, dict):
+                    raise ValueError("SFT tool call function.arguments must decode to a JSON object")
+                function["arguments"] = arguments
+        return normalized
 
     def _to_messages(self, row) -> Optional[List[dict]]:
         """Assemble a [{role, content}, ...] conversation, or None to drop the row.
@@ -243,6 +274,7 @@ class SFTDataset(Dataset):
             messages.append({"role": "assistant", "content": reply})
         if not any(m.get("role") == "assistant" for m in messages):
             return None  # nothing to train on
+        messages = [self._normalize_openai_tool_calls(m) for m in messages]
         if self.expand_image_placeholder:
             messages = [split_image_placeholder(m) for m in messages]
         return messages
@@ -259,7 +291,9 @@ class SFTDataset(Dataset):
         row = self.rows[idx]
         messages = json.loads(row["conversation"])
         images = row["images"] if self._has_images else None
-        text = self.text_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+        tools = json.loads(row["tools"]) if row["tools"] else None
+        kwargs = {"tools": tools} if tools else {}
+        text = self.text_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, **kwargs)
         token_ids, mm_inputs = self._tokenize(text, images)
         loss_mask = self._loss_mask(token_ids)
         if not any(loss_mask):
