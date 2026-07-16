@@ -36,6 +36,7 @@ if "ray" not in sys.modules:
 
     fake_ray.remote = remote
     fake_ray.get = MagicMock()
+    fake_ray.put = MagicMock()
     fake_ray.wait = MagicMock()
     fake_ray.cancel = MagicMock()
     fake_util = types.ModuleType("ray.util")
@@ -506,7 +507,7 @@ def test_dispatch_forwards_rollout_and_policy_metadata():
     generator = object.__new__(SamplesGenerator)
     generator.args = SimpleNamespace(
         rollout=SimpleNamespace(n_samples_per_prompt=4),
-        algo=SimpleNamespace(advantage=SimpleNamespace(is_correction_enable=False)),
+        algo=SimpleNamespace(advantage=SimpleNamespace(is_correction_level="off")),
     )
     generator.agent_runners = [actor]
     generator._rr = 0
