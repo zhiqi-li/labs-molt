@@ -91,6 +91,28 @@ def _wire_fake_vllm(generator, monkeypatch, to_sample):
     monkeypatch.setattr(samples_generator.ray, "get", lambda handle: [handle])
 
 
+def test_generate_eval_samples_uses_independent_eval_batch_size():
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        eval=SimpleNamespace(batch_size=3),
+        rollout=SimpleNamespace(batch_size=1),
+    )
+    generator.eval_dataloader = _prompt_loader(5)
+    requested_batch_sizes = []
+
+    def fake_generate_batch(dataloader_iter, num_prompts, dynamic_filtering, **_kwargs):
+        requested_batch_sizes.append(num_prompts)
+        prompts, _, _, _, exhausted = samples_generator._collect_prompt_batch(dataloader_iter, num_prompts)
+        return [_sample(prompt) for prompt in prompts], len(prompts), exhausted
+
+    generator._generate_batch = fake_generate_batch
+
+    samples = generator.generate_eval_samples()
+
+    assert [sample.group_ids[0] for sample in samples] == ["p0", "p1", "p2", "p3", "p4"]
+    assert requested_batch_sizes == [3, 3]
+
+
 def test_generate_samples_returns_batch_as_rollouts_finish_and_keeps_pool_saturated(monkeypatch):
     generator = object.__new__(SamplesGenerator)
     generator.args = SimpleNamespace(
