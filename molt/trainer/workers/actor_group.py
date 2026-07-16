@@ -81,7 +81,7 @@ class BaseModelActor(BaseDistributedActor):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    def execute_batch(self, method_name: str, all_data, start_idx, end_idx):
+    def execute_batch(self, method_name: str, all_data, start_idx, end_idx, valid_result_count: int | None = None):
         """Call ``self.<method_name>`` once per item in a slice of the batched data.
 
         Args:
@@ -90,6 +90,9 @@ class BaseModelActor(BaseDistributedActor):
                 ``[start_idx:end_idx]`` and zipped into per-item kwargs.
             start_idx (int): start of this worker's slice (inclusive).
             end_idx (int): end of this worker's slice (exclusive).
+            valid_result_count (int, optional): number of leading results to
+                return.  All items are still executed; this is used for
+                collective-safe dummy forwards whose results must be discarded.
 
         Returns:
             List[Any]: one result per item in the slice.
@@ -105,6 +108,13 @@ class BaseModelActor(BaseDistributedActor):
             if len(param_value) != list_length:
                 raise ValueError(f"Parameter {param_name} has length {len(param_value)}, expected {list_length}")
 
+        if valid_result_count is None:
+            valid_result_count = list_length
+        if not 0 <= valid_result_count <= list_length:
+            raise ValueError(
+                f"valid_result_count={valid_result_count} is outside [0, {list_length}]"
+            )
+
         # Get the function to execute
         func = getattr(self, method_name)
         if not callable(func):
@@ -116,7 +126,8 @@ class BaseModelActor(BaseDistributedActor):
             sample_kwargs = {param_name: param_value[i] for param_name, param_value in kwargs.items()}
 
             result = func(**sample_kwargs)
-            results.append(result)
+            if i < valid_result_count:
+                results.append(result)
 
         return results
 
@@ -281,17 +292,26 @@ class RayActorGroup:
             refs.append(method.remote(*args, **kwargs))
         return refs
 
-    def async_run_method_batch(self, method_name, **kwargs):
+    def async_run_method_batch(self, method_name, *, pad_to_divisible=False, **kwargs):
         """Run method on all actors with batched input data asynchronously using round-robin scheduling.
         Each actor processes one chunk of data at a time. Actors in the same ring / tensor parallel group process the same chunk.
 
         Args:
             method_name (str): Name of the method to run
+            pad_to_divisible (bool): if true, execute duplicate trailing items
+                so every effective DP rank enters the same number of collective
+                forwards, but omit the duplicate results.  This is only safe for
+                read-only methods such as no-grad ``forward``.
             **kwargs: Keyword arguments for the method. Each value should be a list/tensor of the same length.
 
         Returns:
             List[ray.ObjectRef]: List of remote object references to the results
         """
+        if pad_to_divisible and method_name != "forward":
+            raise ValueError(
+                "pad_to_divisible is restricted to the read-only forward method"
+            )
+
         # Check if all kwargs parameters are iterable
         for key, value in kwargs.items():
             if not hasattr(value, "__len__"):
@@ -311,23 +331,49 @@ class RayActorGroup:
         # Calculate chunk size based on number of effective actors (considering ring groups)
         num_actors = len(self._actor_handlers)
         effective_actors = num_actors // self.duplicate_actors
-        if total_length == 0 or total_length < effective_actors:
+        if total_length == 0:
             raise ValueError(
-                f"Insufficient batch size for async_run_method_batch: total_length={total_length}, "
-                f"effective_actors={effective_actors}"
+                "Insufficient batch size for async_run_method_batch: total_length=0"
             )
         base_chunk_size, remainder = divmod(total_length, effective_actors)
         # Each forward is an FSDP all-gather (a collective over the DP group), so every DP rank must run
         # the same number of forwards; an uneven split would deadlock the rank with an extra item. The
         # batch is built to divide evenly (samples_generator hands back complete groups => a multiple of
         # n_samples), so fail loud here if that invariant is ever broken rather than silently hang.
-        if remainder != 0:
+        if (total_length < effective_actors or remainder != 0) and not pad_to_divisible:
             raise ValueError(
                 f"async_run_method_batch: batch of {total_length} is not divisible across "
                 f"{effective_actors} DP ranks (remainder {remainder}); an uneven per-rank forward count "
                 "deadlocks the FSDP all-gather. Ensure the rollout batch is a multiple of the DP-rank "
                 "count (complete groups: rollout.batch_size * n_samples_per_prompt)."
             )
+
+        dispatch_kwargs = kwargs
+        dispatch_length = total_length
+        if pad_to_divisible and remainder != 0:
+            padding = effective_actors - remainder
+            # Experience-making forwards are read-only.  Replaying the final
+            # microbatch is therefore a lossless way to give every FSDP rank
+            # the same collective count; execute_batch trims these dummy
+            # results before they reach advantages or optimization.
+            dispatch_kwargs = {
+                key: list(value) + [value[-1]] * padding for key, value in kwargs.items()
+            }
+            dispatch_length += padding
+            base_chunk_size = dispatch_length // effective_actors
+            logging.getLogger(__name__).warning(
+                "async_run_method_batch: padding %s dummy invocation(s) for read-only %s "
+                "for %s-way DP collective alignment (%s -> %s)",
+                padding,
+                method_name,
+                effective_actors,
+                total_length,
+                dispatch_length,
+            )
+        elif pad_to_divisible and total_length < effective_actors:
+            # divmod(total_length, effective_actors) always has a non-zero
+            # remainder for a positive short batch, so this is defensive only.
+            raise AssertionError("short forward batch was not padded")
 
         # Pre-slice data before ray.put so each worker only receives its chunk.
         # This avoids transferring the full batch to every node (critical at scale).
@@ -336,12 +382,15 @@ class RayActorGroup:
             start_idx = chunk_idx * base_chunk_size
             end_idx = start_idx + base_chunk_size
 
-            chunk_data = {key: value[start_idx:end_idx] for key, value in kwargs.items()}
+            chunk_data = {key: value[start_idx:end_idx] for key, value in dispatch_kwargs.items()}
             chunk_ref = ray.put(chunk_data)
+            valid_result_count = max(
+                0, min(end_idx, total_length) - min(start_idx, total_length)
+            )
 
             for j in range(self.duplicate_actors):
                 actor_idx = chunk_idx * self.duplicate_actors + j
                 actor = self._actor_handlers[actor_idx]
-                refs.append(actor.execute_batch.remote(method_name, chunk_ref, 0, base_chunk_size))
+                refs.append(actor.execute_batch.remote(method_name, chunk_ref, 0, base_chunk_size, valid_result_count))
 
         return refs
