@@ -276,14 +276,22 @@ def make_experience_batch(items: List[Experience]) -> Experience:
                 raise ValueError(f"Unsupported tensor field batching rule for {f.name}")
         elif isinstance(first, dict):
             kwargs[f.name] = {}
-            for key in first.keys():
-                vals = [getattr(item, f.name)[key] for item in items]
+            mappings = [getattr(item, f.name) for item in items]
+            if not all(isinstance(mapping, dict) for mapping in mappings):
+                raise TypeError(f"Inconsistent types in {f.name}")
+            # Sparse environment metrics are not applicable to every sample.
+            # Retain only common keys instead of raising or imputing fake zeros.
+            common_keys = set.intersection(*(set(mapping) for mapping in mappings))
+            for key in sorted(common_keys):
+                vals = [mapping[key] for mapping in mappings]
                 if not vals:
                     continue
                 first_type = type(vals[0])
                 if not all(isinstance(v, first_type) for v in vals):
                     raise TypeError(f"Inconsistent types in {f.name}[{key}]")
-                if all(isinstance(v, (int, float)) for v in vals):
+                if all(isinstance(v, torch.Tensor) for v in vals):
+                    kwargs[f.name][key] = torch.stack(vals)
+                elif all(isinstance(v, (int, float)) for v in vals):
                     kwargs[f.name][key] = torch.tensor(vals)
                 else:
                     kwargs[f.name][key] = vals
@@ -340,6 +348,25 @@ def balance_experiences(experiences, args):
             f"divides evenly across {effective_num} DP ranks."
         )
         items_all = items_all[:-remainder]
+
+    # Each DP rank enters collectives with its metric dictionary, so the keys
+    # must also agree across partitions. Compute the global intersection before
+    # balancing rather than allowing each rank-local batch to choose its own.
+    for f in fields(Experience):
+        mappings = [getattr(item, f.name) for item in items_all]
+        if not mappings or not all(isinstance(mapping, dict) for mapping in mappings):
+            continue
+        common_keys = set.intersection(*(set(mapping) for mapping in mappings))
+        all_keys = set.union(*(set(mapping) for mapping in mappings))
+        sparse_keys = sorted(all_keys - common_keys)
+        if sparse_keys:
+            logger.warning(
+                "[balance_experiences] dropping sparse per-sample keys from %s: %s",
+                f.name,
+                sparse_keys,
+            )
+            for item, mapping in zip(items_all, mappings):
+                setattr(item, f.name, {key: mapping[key] for key in common_keys})
 
     lengths = [
         int(item.total_length.item() if isinstance(item.total_length, torch.Tensor) else item.total_length)

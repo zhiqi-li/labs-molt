@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import torch
 
 from molt.trainer.algorithm.experience import Experience, balance_experiences, get_model_parallel_size
+from molt.trainer.algorithm.experience import make_experience_batch
 
 
 def _args(cp=1, tp=1, ep=1, actor_gpus=1):
@@ -60,3 +61,40 @@ def test_balance_experiences_equalizes_per_rank_counts():
     counts = [len(item.sequences) for item in balanced]
     assert counts == [2, 2, 2, 2]  # equal counts, trailing remainder dropped
     assert sum(counts) == 8
+
+
+def test_make_experience_batch_keeps_only_common_metrics_and_stacks_tensors():
+    items = [
+        (
+            Experience(info={"common": value, "only_first": 1.0})
+            if index == 0
+            else Experience(info={"common": value, "only_second": 2.0})
+        )
+        for index, value in enumerate((torch.tensor(3.0), torch.tensor(4.0)))
+    ]
+
+    batch = make_experience_batch(items)
+
+    assert set(batch.info) == {"common"}
+    torch.testing.assert_close(batch.info["common"], torch.tensor([3.0, 4.0]))
+
+
+def test_balance_experiences_uses_global_metric_key_intersection():
+    experiences = []
+    for index in range(4):
+        info = {"common": torch.tensor([float(index)])}
+        if index < 2:
+            info["subset"] = torch.tensor([10.0 + index])
+        experiences.append(
+            Experience(
+                sequences=torch.tensor([[index, index + 1]]),
+                attention_mask=torch.ones(1, 2, dtype=torch.long),
+                total_length=torch.tensor([2]),
+                info=info,
+            )
+        )
+
+    balanced = balance_experiences(experiences, _args(actor_gpus=2))
+
+    assert len(balanced) == 2
+    assert all(set(batch.info) == {"common"} for batch in balanced)
