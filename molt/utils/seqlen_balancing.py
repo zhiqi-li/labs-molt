@@ -173,3 +173,80 @@ def get_minimum_num_micro_batch_size(total_lengths, max_tokens_per_gpu, cp_size,
             batches.append(l)
 
     return len(batches)
+
+
+def get_forward_balanced_partitions(costs: List[int], effective_actor_num: int) -> List[List[int]]:
+    """Partition forward microbatches by cost and collective-safe item count.
+
+    Ray's model actor dispatcher assigns contiguous, equal-sized chunks and
+    pads a non-divisible tail with read-only duplicate forwards. Multi-turn
+    embodied rollouts arrive in trajectory order, so a long failed trajectory
+    can otherwise put hundreds of expensive forwards on one rank while an
+    early rank reaches the next FSDP collective and times out.
+    """
+    if effective_actor_num <= 0:
+        raise ValueError(f"Invalid effective actor count: {effective_actor_num}")
+    if not costs:
+        raise ValueError("Cannot balance an empty forward batch")
+    if any(isinstance(cost, bool) or not isinstance(cost, int) or cost <= 0 for cost in costs):
+        raise ValueError(f"Forward costs must be positive integers, got: {costs!r}")
+
+    item_count = len(costs)
+    chunk_size = (item_count + effective_actor_num - 1) // effective_actor_num
+    capacities = [
+        min(chunk_size, max(0, item_count - rank * chunk_size))
+        for rank in range(effective_actor_num)
+    ]
+
+    if item_count % effective_actor_num == 0:
+        partitions = get_seqlen_balanced_partitions(
+            costs, effective_actor_num, equal_size=True
+        )
+    else:
+        partitions = [[] for _ in range(effective_actor_num)]
+        totals = [0] * effective_actor_num
+        remaining = list(capacities)
+        unassigned = set(range(item_count))
+
+        # The dispatcher repeats the final real item for padding. Keep that
+        # duplicate as cheap as possible.
+        final_rank = max(rank for rank, capacity in enumerate(capacities) if capacity)
+        shortest = min(range(item_count), key=lambda idx: (costs[idx], idx))
+        partitions[final_rank].append(shortest)
+        totals[final_rank] += costs[shortest]
+        remaining[final_rank] -= 1
+        unassigned.remove(shortest)
+
+        # Capacity-constrained longest-processing-time scheduling preserves the
+        # exact real-item counts expected by the contiguous padded dispatcher.
+        for idx in sorted(unassigned, key=lambda item: (-costs[item], item)):
+            eligible = [rank for rank, slots in enumerate(remaining) if slots]
+            if not eligible:  # pragma: no cover - guarded by capacity arithmetic
+                raise AssertionError("Forward partition capacities were exhausted early")
+            rank = min(
+                eligible,
+                key=lambda candidate: (
+                    totals[candidate],
+                    len(partitions[candidate]),
+                    candidate,
+                ),
+            )
+            partitions[rank].append(idx)
+            totals[rank] += costs[idx]
+            remaining[rank] -= 1
+
+    if [len(partition) for partition in partitions] != capacities:
+        raise AssertionError(
+            "Forward partition count mismatch: "
+            f"actual={[len(partition) for partition in partitions]}, expected={capacities}"
+        )
+    flattened = [idx for partition in partitions for idx in partition]
+    if sorted(flattened) != list(range(item_count)):
+        raise AssertionError("Forward partitions did not preserve every microbatch exactly once")
+
+    # Ranks enter the kth FSDP collective in lockstep. Pair similarly sized
+    # forwards at each position instead of leaving a late long-tail straggler.
+    return [
+        sorted(partition, key=lambda idx: (-costs[idx], idx))
+        for partition in partitions
+    ]
