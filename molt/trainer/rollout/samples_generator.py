@@ -154,11 +154,14 @@ class SamplesGenerator:
             self._eval_dataloader_iter = iter(self.eval_dataloader)
 
         all_experiences: List[Experience] = []
+        eval_batch_size = getattr(self.args.eval, "batch_size", None) or self.args.rollout.batch_size
+        if eval_batch_size <= 0:
+            raise ValueError(f"eval.batch_size must be positive, got {eval_batch_size}")
         try:
             while True:
                 experiences, _, exhausted = self._generate_batch(
                     dataloader_iter=self._eval_dataloader_iter,
-                    num_prompts=self.args.rollout.batch_size,
+                    num_prompts=eval_batch_size,
                     dynamic_filtering=False,
                     **generate_kwargs,
                 )

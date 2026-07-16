@@ -783,6 +783,12 @@ if __name__ == "__main__":
     # Eval
     parser.add_argument("--eval.dataset", type=str, default=None, help="Path to the evaluation dataset")
     parser.add_argument("--eval.split", type=str, default="train")
+    parser.add_argument(
+        "--eval.batch_size",
+        type=int,
+        default=None,
+        help="Number of evaluation prompts to dispatch concurrently. Defaults to rollout.batch_size.",
+    )
     parser.add_argument("--eval.steps", type=int, default=-1, help="Evaluate every N steps; -1 disables eval.")
     parser.add_argument(
         "--eval.temperature",
