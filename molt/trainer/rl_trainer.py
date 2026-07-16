@@ -31,6 +31,7 @@ from molt.trainer.algorithm.kl_controller import AdaptiveKLController, FixedKLCo
 from molt.trainer.fsdp import FsdpStrategy
 from molt.trainer.rollout.experience_maker import RemoteExperienceMaker
 from molt.trainer.rollout.samples_generator import SamplesGenerator
+from molt.trainer.terminal_checkpoint import handle_terminal_payload, make_terminal_payload
 from molt.trainer.vllm.vllm_engine import batch_vllm_engine_call
 from molt.trainer.workers.actor_group import RayActorGroup
 from molt.utils.distributed_sampler import DistributedSampler
@@ -482,7 +483,7 @@ class BaseRLTrainer:
             ray.get(refs)
             logger.info(f"Saved best checkpoint: {tag} ({metric_key}={current_value:.4f})")
 
-    def save_logs_and_checkpoints(self, global_step: int, logs_dict=None, client_states=None) -> None:
+    def save_logs_and_checkpoints(self, global_step: int, logs_dict=None, client_states=None) -> bool:
         logs_dict = logs_dict or {}
         if global_step % self.args.logger.logging_steps == 0:
             if self.wandb_logger:
@@ -514,6 +515,36 @@ class BaseRLTrainer:
                     method_name="save_checkpoint", tag=tag, metric_value=metric_value, metric_key=metric_key
                 )
             ray.get(refs)
+            return True
+        return False
+
+    def save_terminal_checkpoint(self, global_step: int, client_states: Dict) -> None:
+        """Persist an exhausted dataloader state even when save cadence is not due.
+
+        The generator sends this state only after observing ``StopIteration``.
+        Queue FIFO ordering guarantees all preceding rollout batches have been
+        optimized when this method runs, so ``global_step`` names the completed
+        endpoint rather than a speculative next step.
+        """
+        loader_state = client_states.get("data_loader_state_dict", {})
+        if not bool(loader_state.get("_iterator_finished", False)):
+            raise RuntimeError("refusing to save a terminal checkpoint before iterator exhaustion")
+        tag = f"global_step{global_step}"
+        metric_value = self._latest_eval_metric_value
+        metric_key = client_states.get("checkpoint_metric_key") or self.best_eval_metric_key or None
+        refs = self.actor_model_group.async_run_method(
+            method_name="save_checkpoint",
+            tag=tag,
+            client_states=client_states,
+            metric_value=metric_value,
+            metric_key=metric_key,
+        )
+        if self.critic_model_group is not None:
+            refs += self.critic_model_group.async_run_method(
+                method_name="save_checkpoint", tag=tag, metric_value=metric_value, metric_key=metric_key
+            )
+        ray.get(refs)
+        logger.info("Saved terminal checkpoint: %s", tag)
 
     def load_checkpoint_states_or_default(self) -> Dict:
         ckpt_path = os.path.join(self.args.ckpt.path, "_actor")
@@ -627,6 +658,7 @@ class GenerateSamplesActor:
         # normal eval_steps multiples a continuous run would hit (no per-resume eval).
         # Fresh runs are already in sync (step-0 baseline + _next_eval_step=eval_steps).
         eval_synced = fresh_start
+        terminal_client_states = None
         for ep in range(episode, self.args.train.num_episodes):
             # Reshuffle prompts each episode (seed+epoch); without this every
             # episode replays the identical order. The generator rebuilds its
@@ -752,10 +784,22 @@ class GenerateSamplesActor:
                     self.rollout_slots.put(global_step, block=True)
 
                 if is_exhausted:
+                    # For an exact full final batch, StatefulDataLoader only sets
+                    # _iterator_finished on this following zero-sample probe. The
+                    # optimizer batch is already queued, so carry the post-probe
+                    # state as a distinct FIFO message instead of losing it.
+                    terminal_client_states = {
+                        "episode": ep,
+                        "total_consumed_prompts": total_consumed_prompts,
+                        "data_loader_state_dict": self.prompts_dataloader.state_dict(),
+                        "rollout_generator_state_dict": self.samples_generator.state_dict(),
+                    }
                     break
 
             pbar.close()
 
+        if terminal_client_states is not None:
+            self.rollout_queue.put(make_terminal_payload(terminal_client_states), block=True)
         self.rollout_queue.put("done", block=True)
 
 
@@ -793,6 +837,7 @@ class TrainingActor(BaseRLTrainer):
     def fit(self, global_step: int = 0) -> None:
         step_start_time = time.time()
         self._latest_client_states = {}
+        self._last_checkpoint_client_states = None
         while True:
             # Time the block — in this async split, the trainer stuck here means the
             # actor side is sitting IDLE waiting for a rollout to be produced (e.g. during
@@ -802,6 +847,24 @@ class TrainingActor(BaseRLTrainer):
             actor_idle_wait = time.time() - _queue_wait_t0
             if payload == "done":
                 break
+
+            # A short final batch can already have saved this exact exhausted
+            # state on the regular cadence. An exact-full final batch cannot:
+            # its cadence save predates the StopIteration probe and therefore
+            # differs at _iterator_finished, so overwrite it with the safe
+            # terminal state (or create it when cadence was not due).
+            terminal_client_states = handle_terminal_payload(
+                payload,
+                global_step=global_step,
+                best_eval_metric_key=self.best_eval_metric_key,
+                best_eval_metric_value=self.best_eval_metric_value,
+                last_checkpoint_client_states=self._last_checkpoint_client_states,
+                save_terminal_checkpoint=self.save_terminal_checkpoint,
+            )
+            if terminal_client_states is not None:
+                self._latest_client_states = terminal_client_states
+                self._last_checkpoint_client_states = dict(terminal_client_states)
+                continue
 
             if payload[0] == "eval":
                 _, eval_step, eval_metrics = payload
@@ -852,7 +915,8 @@ class TrainingActor(BaseRLTrainer):
 
             client_states.update({"global_step": global_step})
             self._latest_client_states = client_states
-            self.save_logs_and_checkpoints(global_step, status, client_states)
+            if self.save_logs_and_checkpoints(global_step, status, client_states):
+                self._last_checkpoint_client_states = dict(client_states)
 
         if self.wandb_logger:
             self.wandb_logger.close()
