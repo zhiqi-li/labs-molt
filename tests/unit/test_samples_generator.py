@@ -15,6 +15,7 @@
 
 import sys
 import types
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -154,6 +155,26 @@ def test_generate_samples_pool_persists_across_calls(monkeypatch):
     assert [handle.group_id for handle in generator._inflight_rollouts] == ["p6", "p7", "p8", "p9"]
 
 
+def test_generate_samples_drains_exhausted_episode_tail_before_restart(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=1, vllm_generate_batch_size=5),
+        algo=SimpleNamespace(dynamic_filtering_enable=False),
+        ckpt=SimpleNamespace(warm_resume_rollouts=False),
+    )
+    generator.prompts_dataloader = _prompt_loader(4)
+    _wire_fake_vllm(generator, monkeypatch, _sample)
+
+    first, *_ = generator.generate_samples()
+    second, _, newly_dispatched, exhausted = generator.generate_samples()
+
+    assert [sample.group_ids[0] for sample in first] == ["p0", "p1", "p2"]
+    assert [sample.group_ids[0] for sample in second] == ["p3"]
+    assert newly_dispatched == 0
+    assert exhausted is True
+    assert generator._episode_active is False
+
+
 def test_generator_keeps_no_checkpoint_state_and_resumes_from_dataloader(monkeypatch):
     """The in-flight pool is intentionally NOT persisted.
 
@@ -218,6 +239,33 @@ def test_generate_samples_drops_filtered_groups_and_refills_their_slots(monkeypa
     # The filtered group is tallied by reason for observability.
     assert rollout_metrics["rollout/dropped/dynamic_filter"] == 1.0
     assert rollout_metrics["rollout/dropped/total"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("rollout_kind", "expected_ids"),
+    [("train", []), ("eval", ["r0"])],
+)
+def test_filter_group_requires_complete_siblings_only_for_training(monkeypatch, rollout_kind, expected_ids):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(n_samples_per_prompt=2),
+        algo=SimpleNamespace(dynamic_filtering_range=(0.0, 1.0)),
+    )
+    response = SimpleNamespace(rollout_id="r0")
+    experience = SimpleNamespace(rollout_ids=[response.rollout_id], scores=None)
+    monkeypatch.setattr(samples_generator.ray, "get", lambda _handle: [response])
+    generator._process_response_into_experience = lambda _response, **_kwargs: (experience, None)
+    drop_counts = defaultdict(int)
+
+    kept = generator._filter_group(
+        object(),
+        dynamic_filtering=False,
+        drop_counts=drop_counts,
+        rollout_kind=rollout_kind,
+    )
+
+    assert [sample.rollout_ids[0] for sample in kept] == expected_ids
+    assert dict(drop_counts) == ({"incomplete_group": 1} if rollout_kind == "train" else {})
 
 
 def test_process_response_counts_only_action_tokens_for_multiturn_lengths():

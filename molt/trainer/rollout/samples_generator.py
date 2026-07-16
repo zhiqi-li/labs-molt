@@ -187,13 +187,17 @@ class SamplesGenerator:
         a weight refit pauses/resumes the engines (see broadcast_to_vllm), so the
         in-flight rollouts survive it.
         """
-        if getattr(self, "_dataloader_iter", None) is None:
+        # The iterator can be exhausted while its slow tail is still in flight.
+        # Keep the episode active until that tail and every buffered group drain;
+        # otherwise the next call would restart the dataloader and discard work.
+        if not getattr(self, "_episode_active", False):
             self._dataloader_iter = iter(self.prompts_dataloader)
             # Seed from a warm-resume buffer if load_state_dict restored one, so the first
             # post-resume batch ships without waiting for a full fresh generation. Consumed once.
             self._finished_samples: List[Experience] = list(getattr(self, "_resumed_samples", None) or [])
             self._resumed_samples = None
             self._inflight_rollouts: List = []
+            self._episode_active = True
 
         groups_per_batch = self.args.rollout.batch_size
         inflight_capacity = getattr(self.args.rollout, "vllm_generate_batch_size", None) or groups_per_batch
@@ -273,6 +277,8 @@ class SamplesGenerator:
 
         # Exhausted only once the dataloader is done AND nothing is buffered or in flight.
         exhausted = self._dataloader_iter is None and not self._finished_samples and not self._inflight_rollouts
+        if exhausted:
+            self._episode_active = False
         return batch_samples, rollout_metrics, prompts_dispatched, exhausted
 
     def _passes_dynamic_filter(self, group_samples) -> bool:
@@ -320,6 +326,19 @@ class SamplesGenerator:
             elif drop_reason is not None:
                 drop_counts[drop_reason] += 1
 
+        # Training baselines and batch divisibility both require complete sibling
+        # groups, regardless of whether dynamic reward filtering is enabled.
+        # Evaluation keeps partial groups so infrastructure failures stay visible.
+        rollout_kind = str(generate_kwargs.get("rollout_kind", "train")).strip().lower()
+        require_complete_group = dynamic_filtering or rollout_kind == "train"
+        if require_complete_group and group_samples:
+            n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+            # Multi-turn rollouts may emit several step-samples with one rollout ID.
+            n_rollouts = len({(s.rollout_ids[0] if getattr(s, "rollout_ids", None) else id(s)) for s in group_samples})
+            if n_rollouts < n_samples:
+                drop_counts["incomplete_group"] += len(group_samples)
+                return []
+
         if dynamic_filtering and group_samples:
             # Pre-filter score stats (the model's TRUE judge pass rate over scored samples, BEFORE
             # DAPO drops uniform groups). Accumulate here, before any keep/drop decision, so the
@@ -334,21 +353,6 @@ class SamplesGenerator:
                     score_stats["groups"] += 1.0
                     score_stats["all_pass"] += float(gmean >= max_score)
                     score_stats["all_fail"] += float(gmean <= min_score)
-            # Require COMPLETE groups: a group that lost a response to a per-response drop
-            # (vlm_truncation / no_action_tokens / logprob_misalign / ...) has < n_samples
-            # usable samples, which would pull the accepted count off train_batch_size and make
-            # it indivisible by the DP-rank count -> per-sample forward microbatches split unevenly
-            # -> NCCL collective desync/hang. Drop+backfill the whole group so each accepted group
-            # contributes exactly n_samples (batch stays a clean groups_per_batch * n_samples).
-            n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
-            # Count ROLLOUTS, not step-samples: a multi-turn / context-compacting agent emits
-            # several step-samples per rollout sharing one rollout_id (see experience.py), so
-            # len(group_samples) over-counts and a group that actually lost a rollout could still
-            # pass this completeness check. Count distinct rollout_ids (single-turn: 1 each, == old).
-            n_rollouts = len({(s.rollout_ids[0] if getattr(s, "rollout_ids", None) else id(s)) for s in group_samples})
-            if n_rollouts < n_samples:
-                drop_counts["incomplete_group"] += len(group_samples)
-                return []
             if not self._passes_dynamic_filter(group_samples):
                 drop_counts["dynamic_filter"] += len(group_samples)
                 return []
