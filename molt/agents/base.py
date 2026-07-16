@@ -256,6 +256,8 @@ class Runner(ABC):
         llm_engine,
         images=None,
         tools=None,
+        rollout_group_id: str | None = None,
+        rollout_id: str | None = None,
     ) -> Trajectory:
         raise NotImplementedError
 
@@ -289,7 +291,17 @@ class StepEnvRunner(Runner):
         self.env_cls = env_cls
 
     async def execute(
-        self, prompt, label, sampling_params, max_length, hf_tokenizer, llm_engine, images=None, tools=None
+        self,
+        prompt,
+        label,
+        sampling_params,
+        max_length,
+        hf_tokenizer,
+        llm_engine,
+        images=None,
+        tools=None,
+        rollout_group_id: str | None = None,
+        rollout_id: str | None = None,
     ):
         # tools are already rendered into the pre-rendered prompt (dataset chat template);
         # the kwarg exists only for Runner signature parity with the chat path.

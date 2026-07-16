@@ -22,7 +22,9 @@ import aiohttp
 import numpy as np
 import pytest
 
+from molt.agents.base import Trajectory
 from molt.trainer.rollout.router import (
+    AgentRunnerActor,
     RouterGenerateClient,
     _align_features_to_canonical,
     _decode_routed_experts,
@@ -30,6 +32,49 @@ from molt.trainer.rollout.router import (
 
 GEN = "/inference/v1/generate"
 RENDER = "/v1/chat/completions/render"
+
+
+def test_run_group_allocates_identities_before_runner_execution():
+    calls = []
+
+    class _Runner:
+        async def execute(self, **kwargs):
+            calls.append(kwargs)
+            return Trajectory(
+                prompt=kwargs["prompt"],
+                label=kwargs["label"],
+                images=None,
+                observation_text="",
+                observation_tokens=[1],
+            )
+
+    actor = SimpleNamespace(_runner=_Runner(), _tokenizer=None, _client=None)
+    metadata = getattr(AgentRunnerActor, "__ray_metadata__", None)
+    actor_class = getattr(metadata, "modified_class", AgentRunnerActor)
+
+    trajectories = asyncio.run(
+        actor_class.run_group(
+            actor,
+            prompt="p",
+            label="l",
+            images=None,
+            sampling_params=SimpleNamespace(),
+            max_length=8,
+            n_samples=2,
+        )
+    )
+
+    assert len(calls) == len(trajectories) == 2
+    assert calls[0]["rollout_group_id"] == calls[1]["rollout_group_id"]
+    assert calls[0]["rollout_id"] != calls[1]["rollout_id"]
+    assert [trajectory.group_id for trajectory in trajectories] == [
+        calls[0]["rollout_group_id"],
+        calls[1]["rollout_group_id"],
+    ]
+    assert [trajectory.rollout_id for trajectory in trajectories] == [
+        calls[0]["rollout_id"],
+        calls[1]["rollout_id"],
+    ]
 
 
 class _FakeResp:
