@@ -96,26 +96,35 @@ def _wire_fake_vllm(generator, monkeypatch, to_sample):
     monkeypatch.setattr(samples_generator.ray, "get", lambda handle: [handle])
 
 
-def test_generate_eval_samples_uses_independent_eval_batch_size():
+def test_generate_eval_samples_refills_independent_eval_pool(monkeypatch):
     generator = object.__new__(SamplesGenerator)
     generator.args = SimpleNamespace(
         eval=SimpleNamespace(batch_size=3),
-        rollout=SimpleNamespace(batch_size=1),
+        rollout=SimpleNamespace(batch_size=1, n_samples_per_prompt=1),
     )
     generator.eval_dataloader = _prompt_loader(5)
-    requested_batch_sizes = []
+    dispatches = []
 
-    def fake_generate_batch(dataloader_iter, num_prompts, dynamic_filtering, **_kwargs):
-        requested_batch_sizes.append(num_prompts)
-        prompts, _, _, _, exhausted = samples_generator._collect_prompt_batch(dataloader_iter, num_prompts)
-        return [_sample(prompt) for prompt in prompts], len(prompts), exhausted
+    def fake_dispatch(prompts, labels, images=None, tools=None, **_kwargs):
+        dispatches.append(list(prompts))
+        return [SimpleNamespace(group_id=prompt) for prompt in prompts]
 
-    generator._generate_batch = fake_generate_batch
+    generator._dispatch_to_agent_runners = fake_dispatch
+    generator._process_response_into_experience = lambda response, **_kwargs: (
+        _sample(response.group_id),
+        None,
+    )
+    monkeypatch.setattr(
+        samples_generator.ray,
+        "wait",
+        lambda handles, num_returns=1, timeout=None: ([handles[0]], list(handles[1:])),
+    )
+    monkeypatch.setattr(samples_generator.ray, "get", lambda handle: [handle])
 
     samples = generator.generate_eval_samples()
 
     assert [sample.group_ids[0] for sample in samples] == ["p0", "p1", "p2", "p3", "p4"]
-    assert requested_batch_sizes == [3, 3]
+    assert dispatches == [["p0", "p1", "p2"], ["p3"], ["p4"]]
 
 
 def test_generate_samples_returns_batch_as_rollouts_finish_and_keeps_pool_saturated(monkeypatch):

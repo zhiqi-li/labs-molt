@@ -149,7 +149,7 @@ class SamplesGenerator:
 
     @torch.no_grad()
     def generate_eval_samples(self, **generate_kwargs) -> List[Experience]:
-        """Generate evaluation samples for the entire eval dataloader."""
+        """Generate the entire eval set while continuously refilling a bounded pool."""
         if getattr(self, "_eval_dataloader_iter", None) is None:
             self._eval_dataloader_iter = iter(self.eval_dataloader)
 
@@ -157,19 +157,39 @@ class SamplesGenerator:
         eval_batch_size = getattr(self.args.eval, "batch_size", None) or self.args.rollout.batch_size
         if eval_batch_size <= 0:
             raise ValueError(f"eval.batch_size must be positive, got {eval_batch_size}")
+        pending_refs: List = []
+        exhausted = False
+        drop_counts: Dict[str, int] = defaultdict(int)
+        progress = tqdm(desc="Generate eval samples")
         try:
-            while True:
-                experiences, _, exhausted = self._generate_batch(
-                    dataloader_iter=self._eval_dataloader_iter,
-                    num_prompts=eval_batch_size,
-                    dynamic_filtering=False,
-                    **generate_kwargs,
-                )
-                all_experiences.extend(experiences)
-                if exhausted:
+            while not exhausted or pending_refs:
+                free_slots = eval_batch_size - len(pending_refs)
+                if free_slots > 0 and not exhausted:
+                    prompts, labels, images, tools, exhausted = _collect_prompt_batch(
+                        self._eval_dataloader_iter, free_slots
+                    )
+                    if prompts:
+                        pending_refs.extend(
+                            self._dispatch_to_agent_runners(
+                                prompts, labels, images=images, tools=tools, **generate_kwargs
+                            )
+                        )
+
+                if not pending_refs:
                     break
+
+                ready_refs, pending_refs = ray.wait(pending_refs, num_returns=1, timeout=10.0)
+                for ref in ready_refs:
+                    all_experiences.extend(
+                        self._filter_group(ref, False, drop_counts, **generate_kwargs)
+                    )
+                    progress.update(1)
         finally:
+            progress.close()
             self._eval_dataloader_iter = None
+
+        if drop_counts:
+            logger.info(f"Eval rollout drops: {dict(drop_counts)}")
 
         return all_experiences
 
