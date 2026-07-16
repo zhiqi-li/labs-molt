@@ -65,7 +65,6 @@ import io
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
 
 from molt.agents._chat_server import (
     ChatServerState,
@@ -73,7 +72,7 @@ from molt.agents._chat_server import (
     serve_on_current_loop,
     stitch_session,
 )
-from molt.agents.base import Result, Runner
+from molt.agents.base import Result, Runner, rollout_session_id
 from molt.utils.logging_utils import init_logger
 
 # The chat server registers this as the policy model id; agents request it via
@@ -243,7 +242,7 @@ class ChatAgentRunner(Runner):
         policy_frozen: bool = False,
     ):
         await self._ensure_server(llm_engine, hf_tokenizer, max_length, sampling_params)
-        session_id = uuid4().hex
+        session_id = rollout_session_id(sampling_params)
         messages = _wire_messages(prompt, images)
         # Scalar view of the task for grading/logging (and Trajectory.prompt): the last user
         # turn's text — taken from the RAW row (wire messages may have inlined its images).

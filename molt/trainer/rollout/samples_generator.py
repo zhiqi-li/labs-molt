@@ -470,6 +470,7 @@ class SamplesGenerator:
                     rollout_kind=rollout_kind,
                     policy_version=policy_version,
                     policy_frozen=policy_frozen,
+                    base_seed=int(self.args.train.seed),
                 )
             )
         return refs

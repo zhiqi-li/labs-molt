@@ -29,7 +29,10 @@ trainer round-robins prompts across a list of them (``--rollout.num_runners``).
 
 import asyncio
 import base64
+import hashlib
 import io
+import json
+import os
 import socket
 import time
 from copy import deepcopy
@@ -39,6 +42,47 @@ from uuid import uuid4
 import aiohttp
 import numpy as np
 import ray
+
+
+def _deterministic_sampling_seed(
+    *,
+    base_seed: int,
+    rollout_kind: str,
+    policy_version: int,
+    prompt,
+    label,
+    sibling_index: int,
+) -> int:
+    """Derive a stable request seed without sharing RNG streams across siblings.
+
+    Python's built-in ``hash`` is process-randomized, so serialize the scheduler-owned
+    rollout identity and hash it explicitly.  vLLM accepts unsigned 32-bit request
+    seeds; keeping zero available makes the mapping total and deterministic.
+    """
+    rollout_kind = str(rollout_kind)
+    identity = {
+        "base_seed": int(base_seed),
+        "rollout_kind": rollout_kind,
+        # Evaluation must replay the same sampling stream at every checkpoint;
+        # otherwise policy deltas remain confounded by a new stochastic draw.
+        # Training keeps the version in its identity so repeated epochs do not
+        # replay identical siblings after each refit.
+        "policy_version": 0 if rollout_kind == "eval" else int(policy_version),
+        "prompt": prompt,
+        "label": label,
+        "sibling_index": int(sibling_index),
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=repr).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(encoded).digest()[:4], "big", signed=False)
+
+
+def _deterministic_rollouts_enabled() -> bool:
+    value = os.environ.get("MOLT_DETERMINISTIC_ROLLOUTS", "0").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid MOLT_DETERMINISTIC_ROLLOUTS={value!r}")
 
 
 @ray.remote(num_cpus=1)
@@ -336,6 +380,9 @@ async def _execute_runner_with_policy_audit(
         traj.extra_logs["policy_version_end"] = end_version
         traj.extra_logs["policy_frozen"] = float(observed_frozen)
         traj.extra_logs["rollout_kind"] = str(rollout_kind)
+        sampling_seed = getattr(sampling_params, "seed", None)
+        if sampling_seed is not None:
+            traj.extra_logs["sampling_seed"] = int(sampling_seed)
     return result
 
 
@@ -388,19 +435,32 @@ class AgentRunnerActor:
         rollout_kind="train",
         policy_version=0,
         policy_frozen=False,
+        base_seed=42,
     ):
         """N rollouts of one prompt (unchanged runner) -> flattened Trajectories, tagged
         group_id (per prompt; GRPO baseline) + rollout_id (per rollout; multi-turn
         step-samples share it). A failed rollout is dropped, never sinks the group."""
         group_id = uuid4().hex
 
-        async def execute_one():
+        deterministic_rollouts = _deterministic_rollouts_enabled()
+
+        async def execute_one(sibling_index):
+            sibling_sampling_params = deepcopy(sampling_params)
+            if deterministic_rollouts:
+                sibling_sampling_params.seed = _deterministic_sampling_seed(
+                    base_seed=base_seed,
+                    rollout_kind=rollout_kind,
+                    policy_version=policy_version,
+                    prompt=prompt,
+                    label=label,
+                    sibling_index=sibling_index,
+                )
             return await _execute_runner_with_policy_audit(
                 runner=self._runner,
                 version_source=self._version_source,
                 prompt=prompt,
                 label=label,
-                sampling_params=deepcopy(sampling_params),
+                sampling_params=sibling_sampling_params,
                 max_length=max_length,
                 hf_tokenizer=self._tokenizer,
                 llm_engine=self._client,
@@ -411,7 +471,7 @@ class AgentRunnerActor:
                 policy_frozen=policy_frozen,
             )
 
-        tasks = [execute_one() for _ in range(n_samples)]
+        tasks = [execute_one(sibling_index) for sibling_index in range(n_samples)]
         flattened = []
         for r in await asyncio.gather(*tasks, return_exceptions=True):  # a failed rollout must not sink the group
             if isinstance(r, BaseException):

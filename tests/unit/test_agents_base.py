@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from molt.agents.base import Env, Result, StepEnvRunner, _extract_generation_logprobs
+from molt.agents.base import Env, Result, StepEnvRunner, _extract_generation_logprobs, rollout_session_id
 
 
 class _Tokenizer:
@@ -28,6 +28,13 @@ class _Tokenizer:
 
     def decode(self, token_ids, skip_special_tokens=False):
         return "".join(chr(token_id) for token_id in token_ids)
+
+
+def test_rollout_session_id_is_stable_only_when_sampling_is_seeded():
+    seeded = SimpleNamespace(seed=123)
+    assert rollout_session_id(seeded) == rollout_session_id(seeded)
+    assert rollout_session_id(SimpleNamespace(seed=124)) != rollout_session_id(seeded)
+    assert rollout_session_id(SimpleNamespace()) != rollout_session_id(SimpleNamespace())
 
 
 class _OneStepEnv(Env):
