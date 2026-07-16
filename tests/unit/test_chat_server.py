@@ -464,6 +464,73 @@ def test_content_flatten_collects_images(monkeypatch):
     assert text == "look:<image>" and pil == ["PIL"]
 
 
+def test_messages_to_chat_preserves_tool_metadata_without_mutating_wire_messages():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "thinking",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "name": "weather", "content": "sunny"},
+    ]
+    state = SimpleNamespace(expand_image_placeholder=False)
+
+    chat, images = cs._messages_to_chat(state, messages)
+
+    assert images == []
+    assert chat[0]["reasoning_content"] == "thinking"
+    assert chat[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+    assert chat[1]["tool_call_id"] == "call-1"
+    assert chat[1]["name"] == "weather"
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+
+
+def test_run_turn_forwards_chat_template_controls(monkeypatch):
+    class _RecordingProcessor:
+        image_token = "<image>"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(self, chat, **kwargs):
+            self.kwargs = kwargs
+            return "TEXT"
+
+    processor = _RecordingProcessor()
+    state = ChatServerState(
+        _FakeTransport([_act([90], [-0.1])]),
+        processor,
+        "policy",
+        100,
+        _sampling(),
+    )
+    state.open("sid", "p", "l", None)
+    monkeypatch.setattr(cs, "_tokenize_observation", lambda *_args: ([1, 2], None, []))
+    tools = [{"type": "function", "function": {"name": "weather"}}]
+
+    asyncio.run(
+        _run_turn(
+            state,
+            state.sessions["sid"],
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": tools,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+    )
+
+    assert processor.kwargs["tools"] == tools
+    assert processor.kwargs["enable_thinking"] is False
+
+
 # ---------------------------------------------------------------------------
 # stitch_session: every token-exact segment gets the terminal reward (usually one).
 # ---------------------------------------------------------------------------
