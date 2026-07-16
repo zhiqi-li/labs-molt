@@ -403,6 +403,42 @@ async def _execute_runner_with_policy_audit(
     return result
 
 
+def _robolab_infrastructure_retries():
+    """Return the opt-in retry budget for explicitly retryable RoboLab failures."""
+    raw = os.environ.get("NANOBOT_ROBOLAB_ROLLOUT_RETRIES", "0").strip()
+    try:
+        retries = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "NANOBOT_ROBOLAB_ROLLOUT_RETRIES must be a non-negative integer"
+        ) from exc
+    if retries < 0:
+        raise ValueError(
+            "NANOBOT_ROBOLAB_ROLLOUT_RETRIES must be a non-negative integer"
+        )
+    return retries
+
+
+async def _retry_unsafe_robolab_worker(operation, *, retries):
+    """Retry only failures explicitly classified by the RoboLab environment."""
+    for attempt in range(retries + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            retryable = (
+                getattr(exc, "retry_robolab_rollout", False) is True
+                or getattr(exc, "quarantine_robolab_worker", False) is True
+            )
+            if not retryable or attempt == retries:
+                raise
+            print(
+                "[runner] retrying rollout after retryable RoboLab infrastructure "
+                f"failure (attempt {attempt + 2}/{retries + 1}): {exc!r}",
+                flush=True,
+            )
+    raise AssertionError("unreachable")
+
+
 @ray.remote
 class AgentRunnerActor:
     """One rollout driver process: runs the user's agent runner against the router.
@@ -460,32 +496,38 @@ class AgentRunnerActor:
         group_id = uuid4().hex
 
         deterministic_rollouts = _deterministic_rollouts_enabled()
+        infrastructure_retries = _robolab_infrastructure_retries()
 
         async def execute_one(sibling_index):
-            sibling_sampling_params = deepcopy(sampling_params)
-            if deterministic_rollouts:
-                sibling_sampling_params.seed = _deterministic_sampling_seed(
-                    base_seed=base_seed,
-                    rollout_kind=rollout_kind,
-                    policy_version=policy_version,
+            async def execute_attempt():
+                sibling_sampling_params = deepcopy(sampling_params)
+                if deterministic_rollouts:
+                    sibling_sampling_params.seed = _deterministic_sampling_seed(
+                        base_seed=base_seed,
+                        rollout_kind=rollout_kind,
+                        policy_version=policy_version,
+                        prompt=prompt,
+                        label=label,
+                        sibling_index=sibling_index,
+                    )
+                return await _execute_runner_with_policy_audit(
+                    runner=self._runner,
+                    version_source=self._version_source,
                     prompt=prompt,
                     label=label,
-                    sibling_index=sibling_index,
+                    sampling_params=sibling_sampling_params,
+                    max_length=max_length,
+                    hf_tokenizer=self._tokenizer,
+                    llm_engine=self._client,
+                    images=images,
+                    tools=tools,
+                    rollout_kind=rollout_kind,
+                    policy_version=policy_version,
+                    policy_frozen=policy_frozen,
                 )
-            return await _execute_runner_with_policy_audit(
-                runner=self._runner,
-                version_source=self._version_source,
-                prompt=prompt,
-                label=label,
-                sampling_params=sibling_sampling_params,
-                max_length=max_length,
-                hf_tokenizer=self._tokenizer,
-                llm_engine=self._client,
-                images=images,
-                tools=tools,
-                rollout_kind=rollout_kind,
-                policy_version=policy_version,
-                policy_frozen=policy_frozen,
+
+            return await _retry_unsafe_robolab_worker(
+                execute_attempt, retries=infrastructure_retries
             )
 
         tasks = [execute_one(sibling_index) for sibling_index in range(n_samples)]

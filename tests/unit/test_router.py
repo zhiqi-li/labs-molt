@@ -28,6 +28,8 @@ from molt.trainer.rollout.router import (
     _decode_routed_experts,
     _deterministic_sampling_seed,
     _execute_runner_with_policy_audit,
+    _retry_unsafe_robolab_worker,
+    _robolab_infrastructure_retries,
 )
 
 GEN = "/inference/v1/generate"
@@ -376,3 +378,62 @@ def test_execute_runner_stamps_authoritative_policy_provenance(
         "policy_version_end": expected_end,
         "policy_frozen": expected_frozen,
     }
+
+
+class _UnsafeRoboLabWorker(RuntimeError):
+    quarantine_robolab_worker = True
+
+
+def test_robolab_infrastructure_retry_budget_is_opt_in(monkeypatch):
+    monkeypatch.delenv("NANOBOT_ROBOLAB_ROLLOUT_RETRIES", raising=False)
+    assert _robolab_infrastructure_retries() == 0
+    monkeypatch.setenv("NANOBOT_ROBOLAB_ROLLOUT_RETRIES", "3")
+    assert _robolab_infrastructure_retries() == 3
+
+
+@pytest.mark.parametrize("value", ["-1", "not-an-int", "1.5"])
+def test_robolab_infrastructure_retry_budget_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("NANOBOT_ROBOLAB_ROLLOUT_RETRIES", value)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _robolab_infrastructure_retries()
+
+
+def test_retry_unsafe_robolab_worker_succeeds_on_a_clean_worker():
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise _UnsafeRoboLabWorker(f"worker {attempts} crashed")
+        return "valid rollout"
+
+    result = asyncio.run(_retry_unsafe_robolab_worker(operation, retries=3))
+    assert result == "valid rollout"
+    assert attempts == 3
+
+
+def test_retry_unsafe_robolab_worker_does_not_retry_policy_or_transport_failure():
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("ordinary rollout failure")
+
+    with pytest.raises(RuntimeError, match="ordinary rollout failure"):
+        asyncio.run(_retry_unsafe_robolab_worker(operation, retries=3))
+    assert attempts == 1
+
+
+def test_retry_unsafe_robolab_worker_is_bounded():
+    attempts = 0
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        raise _UnsafeRoboLabWorker("simulator crashed")
+
+    with pytest.raises(_UnsafeRoboLabWorker, match="simulator crashed"):
+        asyncio.run(_retry_unsafe_robolab_worker(operation, retries=2))
+    assert attempts == 3
