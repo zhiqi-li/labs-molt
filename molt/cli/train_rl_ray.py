@@ -19,13 +19,46 @@
 import argparse
 import os
 
-from molt.trainer.algorithm.experience import get_model_parallel_size
+
+_AGENT_ENV_PREFIXES = ("NANOBOT_", "ESIBENCH_", "GOMOKU_", "G2048_", "ATARI_")
+
+
+def _ray_runtime_env_vars(environment=None):
+    """Environment required by rollout, trainer, and ESI-Bench Ray actors."""
+    environment = os.environ if environment is None else environment
+    env_vars = {
+        "TOKENIZERS_PARALLELISM": environment.get("TOKENIZERS_PARALLELISM", "true"),
+        "NCCL_DEBUG": environment.get("NCCL_DEBUG", "WARN"),
+        "RAY_ENABLE_ZERO_COPY_TORCH_TENSORS": environment.get("RAY_ENABLE_ZERO_COPY_TORCH_TENSORS", "1"),
+    }
+    for name in (
+        "FLASHINFER_WORKSPACE_BASE",
+        "FLASHINFER_WORKSPACE_DIR",
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "HUGGINGFACE_HUB_CACHE",
+        "NCCL_CUMEM_ENABLE",
+        "TRANSFORMERS_CACHE",
+        "TORCH_COMPILE_DISABLE",
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "PYTHONPATH",
+        "VLLM_CACHE_ROOT",
+        "VLLM_WORKER_MULTIPROC_METHOD",
+        "MOLT_DEFER_GRAD_SYNC",
+    ):
+        if environment.get(name):
+            env_vars[name] = environment[name]
+    for name, value in environment.items():
+        if name.startswith(_AGENT_ENV_PREFIXES):
+            env_vars[name] = value
+    return env_vars
 
 
 def train(args):
     import ray
     from ray.util.placement_group import placement_group
 
+    from molt.trainer.algorithm.experience import get_model_parallel_size
     from molt.trainer.placement import model_placement_strategy
     from molt.trainer.vllm import create_vllm_engines
     from molt.trainer.workers.actor_group import RayActorGroup, ReferenceModelActor
@@ -37,25 +70,7 @@ def train(args):
         # Defaults respect user overrides (e.g. NCCL_DEBUG=INFO via
         # `ray job submit --runtime-env-json`); the listed names are
         # cache/workspace knobs vLLM and HF read inside Ray actors.
-        env_vars = {
-            "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "true"),
-            "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
-            "RAY_ENABLE_ZERO_COPY_TORCH_TENSORS": os.environ.get("RAY_ENABLE_ZERO_COPY_TORCH_TENSORS", "1"),
-        }
-        for name in (
-            "FLASHINFER_WORKSPACE_BASE",
-            "FLASHINFER_WORKSPACE_DIR",
-            "HF_HOME",
-            "HF_HUB_CACHE",
-            "HUGGINGFACE_HUB_CACHE",
-            "TRANSFORMERS_CACHE",
-            "TORCH_COMPILE_DISABLE",
-            "PYTORCH_CUDA_ALLOC_CONF",
-            "VLLM_WORKER_MULTIPROC_METHOD",
-        ):
-            if os.environ.get(name):
-                env_vars[name] = os.environ[name]
-        ray.init(runtime_env={"env_vars": env_vars})
+        ray.init(runtime_env={"env_vars": _ray_runtime_env_vars()})
 
     # configure strategy
     strategy = get_strategy(args)
@@ -100,6 +115,7 @@ def train(args):
             enable_return_routed_experts=args.train.routing_replay,
             pipeline_parallel_size=getattr(args.vllm, "pipeline_parallel_size", 1),
             data_parallel_size=getattr(args.vllm, "data_parallel_size", 1),
+            disable_custom_all_reduce=args.vllm.disable_custom_all_reduce,
         )
 
     # init actor / reference / critic models
@@ -252,6 +268,8 @@ def train(args):
 
 
 if __name__ == "__main__":
+    from molt.trainer.algorithm.experience import get_model_parallel_size
+
     parser = argparse.ArgumentParser()
     from molt.cli.common_args import add_ckpt_args, add_fsdp_args, add_logger_args, add_optimizer_args
 
@@ -348,6 +366,12 @@ if __name__ == "__main__":
         help="sampling probs for datasets",
     )
     parser.add_argument("--data.prompt_split", type=str, default="train")
+    parser.add_argument(
+        "--data.disable_prompt_shuffle",
+        action="store_true",
+        default=False,
+        help="Preserve dataset order for mutable simulator reload waves.",
+    )
     parser.add_argument("--data.max_samples", type=int, default=int(1e8), help="Max number of samples")
     parser.add_argument("--data.max_len", type=int, default=2048, help="Max total sequence length (prompt + response)")
     parser.add_argument("--data.input_key", type=str, default="input", help="JSON dataset key")
@@ -502,6 +526,12 @@ if __name__ == "__main__":
         "TP*PP*DP GPUs; requires --vllm.enable_expert_parallel and the ray executor.",
     )
     parser.add_argument("--vllm.sync_backend", type=str, default="nccl", help="trainer -> vLLM weight sync backend")
+    parser.add_argument(
+        "--vllm.disable_custom_all_reduce",
+        action="store_true",
+        default=False,
+        help="Use the standard distributed backend instead of vLLM custom all-reduce.",
+    )
     parser.add_argument("--vllm.enforce_eager", action="store_true", default=False, help="Disable CUDA graph in vLLM")
     parser.add_argument(
         "--vllm.router_policy",
@@ -775,6 +805,11 @@ if __name__ == "__main__":
         "Fresh runs only — gated on the consumed-prompt counter being 0, so a resume (which loads a "
         "non-zero step) does not add a redundant eval.",
     )
+    parser.add_argument(
+        "--eval.eval_only",
+        action="store_true",
+        help="Run one frozen-policy evaluation and exit without an optimizer step.",
+    )
 
     # Runtime / misc
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank from torchrun")
@@ -973,6 +1008,10 @@ if __name__ == "__main__":
     # --- Eval ---
     if args.eval.dataset:
         assert args.train.agent_path, "`--eval.dataset` requires `--train.agent_path`."
+    if args.eval.eval_only and not args.eval.dataset:
+        raise ValueError("--eval.eval_only requires --eval.dataset")
+    if not args.eval.eval_only and not args.data.prompt_dataset:
+        raise ValueError("--data.prompt_dataset is required unless --eval.eval_only is set")
 
     # --- Runtime ---
     if args.use_ms:

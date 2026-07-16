@@ -17,7 +17,12 @@ from types import SimpleNamespace
 
 import torch
 
-from molt.trainer.algorithm.experience import Experience, balance_experiences, get_model_parallel_size
+from molt.trainer.algorithm.experience import (
+    Experience,
+    balance_experiences,
+    get_model_parallel_size,
+    make_experience_batch,
+)
 
 
 def _args(cp=1, tp=1, ep=1, actor_gpus=1):
@@ -60,3 +65,54 @@ def test_balance_experiences_equalizes_per_rank_counts():
     counts = [len(item.sequences) for item in balanced]
     assert counts == [2, 2, 2, 2]  # equal counts, trailing remainder dropped
     assert sum(counts) == 8
+
+
+def test_make_experience_batch_intersects_sparse_info_keys():
+    first = Experience(
+        sequences=torch.tensor([1, 2]),
+        attention_mask=torch.ones(2, dtype=torch.long),
+        total_length=torch.tensor(2),
+        info={"reward": torch.tensor(1.0), "task_angle": torch.tensor(1.0)},
+    )
+    second = Experience(
+        sequences=torch.tensor([3, 4]),
+        attention_mask=torch.ones(2, dtype=torch.long),
+        total_length=torch.tensor(2),
+        info={"reward": torch.tensor(0.0), "task_deformable": torch.tensor(0.0)},
+    )
+
+    batch = make_experience_batch([first, second])
+
+    assert set(batch.info) == {"reward"}
+    torch.testing.assert_close(batch.info["reward"], torch.tensor([1.0, 0.0]))
+
+
+def test_balance_experiences_uses_global_info_intersection_across_ranks():
+    # Rank-local intersections could differ (one rank gets only angle rows and
+    # another only deformable rows), which would desynchronize the metric-dict
+    # all_reduce.  The global intersection must be applied before partitioning.
+    angle = Experience(
+        sequences=torch.arange(8).view(2, 4),
+        attention_mask=torch.ones(2, 4, dtype=torch.long),
+        total_length=torch.tensor([8, 7]),
+        info={
+            "reward": torch.tensor([1.0, 0.0]),
+            "always_present": torch.tensor([2.0, 2.0]),
+            "task_angle": torch.tensor([0.0, 1.0]),
+        },
+    )
+    deformable = Experience(
+        sequences=torch.arange(8, 16).view(2, 4),
+        attention_mask=torch.ones(2, 4, dtype=torch.long),
+        total_length=torch.tensor([6, 5]),
+        info={
+            "reward": torch.tensor([1.0, 0.0]),
+            "always_present": torch.tensor([2.0, 2.0]),
+            "task_deformable": torch.tensor([2.0, 3.0]),
+        },
+    )
+
+    balanced = balance_experiences([angle, deformable], _args(actor_gpus=2))
+
+    assert len(balanced) == 2
+    assert all(set(rank.info) == {"reward", "always_present"} for rank in balanced)

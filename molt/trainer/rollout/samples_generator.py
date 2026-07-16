@@ -187,13 +187,17 @@ class SamplesGenerator:
         a weight refit pauses/resumes the engines (see broadcast_to_vllm), so the
         in-flight rollouts survive it.
         """
-        if getattr(self, "_dataloader_iter", None) is None:
+        # Iterator exhaustion can happen while a slow tail is still in flight.
+        # Keep an explicit episode lifecycle so the next call does not restart
+        # the dataset before that tail drains.
+        if not getattr(self, "_episode_active", False):
             self._dataloader_iter = iter(self.prompts_dataloader)
             # Seed from a warm-resume buffer if load_state_dict restored one, so the first
             # post-resume batch ships without waiting for a full fresh generation. Consumed once.
             self._finished_samples: List[Experience] = list(getattr(self, "_resumed_samples", None) or [])
             self._resumed_samples = None
             self._inflight_rollouts: List = []
+            self._episode_active = True
 
         groups_per_batch = self.args.rollout.batch_size
         inflight_capacity = getattr(self.args.rollout, "vllm_generate_batch_size", None) or groups_per_batch
@@ -273,6 +277,8 @@ class SamplesGenerator:
 
         # Exhausted only once the dataloader is done AND nothing is buffered or in flight.
         exhausted = self._dataloader_iter is None and not self._finished_samples and not self._inflight_rollouts
+        if exhausted:
+            self._episode_active = False
         return batch_samples, rollout_metrics, prompts_dispatched, exhausted
 
     def _passes_dynamic_filter(self, group_samples) -> bool:
@@ -320,6 +326,18 @@ class SamplesGenerator:
             elif drop_reason is not None:
                 drop_counts[drop_reason] += 1
 
+        # Training must keep complete sibling groups even when DAPO filtering is
+        # disabled. Evaluation retains partial groups so infrastructure failures
+        # remain visible to the strict audit instead of being silently hidden.
+        rollout_kind = str(generate_kwargs.get("rollout_kind", "train")).strip().lower()
+        require_complete_group = dynamic_filtering or rollout_kind == "train"
+        if require_complete_group and group_samples:
+            n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+            n_rollouts = len({(s.rollout_ids[0] if getattr(s, "rollout_ids", None) else id(s)) for s in group_samples})
+            if n_rollouts < n_samples:
+                drop_counts["incomplete_group"] += len(group_samples)
+                return []
+
         if dynamic_filtering and group_samples:
             # Pre-filter score stats (the model's TRUE judge pass rate over scored samples, BEFORE
             # DAPO drops uniform groups). Accumulate here, before any keep/drop decision, so the
@@ -334,21 +352,6 @@ class SamplesGenerator:
                     score_stats["groups"] += 1.0
                     score_stats["all_pass"] += float(gmean >= max_score)
                     score_stats["all_fail"] += float(gmean <= min_score)
-            # Require COMPLETE groups: a group that lost a response to a per-response drop
-            # (vlm_truncation / no_action_tokens / logprob_misalign / ...) has < n_samples
-            # usable samples, which would pull the accepted count off train_batch_size and make
-            # it indivisible by the DP-rank count -> per-sample forward microbatches split unevenly
-            # -> NCCL collective desync/hang. Drop+backfill the whole group so each accepted group
-            # contributes exactly n_samples (batch stays a clean groups_per_batch * n_samples).
-            n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
-            # Count ROLLOUTS, not step-samples: a multi-turn / context-compacting agent emits
-            # several step-samples per rollout sharing one rollout_id (see experience.py), so
-            # len(group_samples) over-counts and a group that actually lost a rollout could still
-            # pass this completeness check. Count distinct rollout_ids (single-turn: 1 each, == old).
-            n_rollouts = len({(s.rollout_ids[0] if getattr(s, "rollout_ids", None) else id(s)) for s in group_samples})
-            if n_rollouts < n_samples:
-                drop_counts["incomplete_group"] += len(group_samples)
-                return []
             if not self._passes_dynamic_filter(group_samples):
                 drop_counts["dynamic_filter"] += len(group_samples)
                 return []
@@ -427,6 +430,9 @@ class SamplesGenerator:
         )
         truncate_length = generate_kwargs.get("max_len", 2048)
         n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+        rollout_kind = generate_kwargs.get("rollout_kind", "train")
+        policy_version = int(generate_kwargs.get("policy_version", 0))
+        policy_frozen = bool(generate_kwargs.get("policy_frozen", False))
         if images is None:
             images = [None] * len(prompts)
         if tools is None:
@@ -437,7 +443,18 @@ class SamplesGenerator:
             actor = self.agent_runners[self._rr % len(self.agent_runners)]
             self._rr += 1
             refs.append(
-                actor.run_group.remote(prompt, label, img, sampling_params, truncate_length, n_samples, tools=tool)
+                actor.run_group.remote(
+                    prompt,
+                    label,
+                    img,
+                    sampling_params,
+                    truncate_length,
+                    n_samples,
+                    tools=tool,
+                    rollout_kind=rollout_kind,
+                    policy_version=policy_version,
+                    policy_frozen=policy_frozen,
+                )
             )
         return refs
 
@@ -470,6 +487,19 @@ class SamplesGenerator:
         """
         truncate_length = generate_kwargs.get("max_len", 2048)
         step_slice = slice(1, truncate_length)
+
+        # Infrastructure failures are not negative policy outcomes. Keep them
+        # in evaluation so the audit can fail visibly, but never train on their
+        # synthetic zero reward or corrupt a sibling baseline.
+        rollout_kind = str(generate_kwargs.get("rollout_kind", "train")).strip().lower()
+        if rollout_kind == "train":
+            extra_logs = response.extra_logs or {}
+            backend_error = any(
+                bool(_to_scalar(extra_logs.get(key))) for key in ("nanobot_backend_error", "esibench_backend_error")
+            )
+            if backend_error:
+                logger.warning("Skipping training rollout terminated by a backend error.")
+                return None, "backend_error"
 
         trajectory_tokens = response.observation_tokens.copy()
         if not trajectory_tokens:

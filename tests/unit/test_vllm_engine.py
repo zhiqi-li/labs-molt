@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import sys
 from dataclasses import dataclass
 from types import ModuleType
@@ -27,6 +28,7 @@ def _install_vllm_test_stub():
         model: str
         dtype: str = "auto"
         enforce_eager: bool = False
+        disable_custom_all_reduce: bool = False
 
     vllm.AsyncEngineArgs = AsyncEngineArgs
     vllm.AsyncLLMEngine = object
@@ -103,6 +105,58 @@ def test_filter_vllm_engine_kwargs_keeps_speculative_config(monkeypatch):
     assert filtered == {"model": "m", "speculative_config": {"num_speculative_tokens": 1}}
 
 
+def test_filter_vllm_engine_kwargs_keeps_disable_custom_all_reduce(monkeypatch):
+    @dataclass
+    class FakeAsyncEngineArgs:
+        model: str
+        disable_custom_all_reduce: bool = False
+
+    monkeypatch.setattr(vllm_engine.vllm, "AsyncEngineArgs", FakeAsyncEngineArgs)
+
+    filtered = vllm_engine._filter_vllm_engine_kwargs({"model": "m", "disable_custom_all_reduce": True})
+
+    assert filtered == {"model": "m", "disable_custom_all_reduce": True}
+
+
 def test_ray_visible_device_flag_is_cuda_only():
     assert vllm_engine.ray_noset_visible_devices({"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"})
     assert not vllm_engine.ray_noset_visible_devices({"RAY_EXPERIMENTAL_NOSET_OTHER_VISIBLE_DEVICES": "1"})
+
+
+def _rollout_actor_instance(llm):
+    metadata = getattr(vllm_engine.RolloutRayActor, "__ray_metadata__", None)
+    actor_class = getattr(metadata, "modified_class", vllm_engine.RolloutRayActor)
+    actor = actor_class.__new__(actor_class)
+    actor.llm = llm
+    actor._weight_version = 0
+    return actor
+
+
+def test_weight_version_advances_only_after_successful_packed_update():
+    class FakeLLM:
+        def __init__(self):
+            self.fail = False
+
+        async def collective_rpc(self, method, args):
+            assert method == "update_weights_packed"
+            if self.fail:
+                raise RuntimeError("broadcast failed")
+            return "ok"
+
+    llm = FakeLLM()
+    actor = _rollout_actor_instance(llm)
+
+    assert asyncio.run(actor.get_weight_version()) == 0
+    assert asyncio.run(actor.update_weights_packed([("a", "bf16", (1,))])) == "ok"
+    assert asyncio.run(actor.get_weight_version()) == 1
+    assert asyncio.run(actor.update_weights_packed([("b", "bf16", (1,))])) == "ok"
+    assert asyncio.run(actor.get_weight_version()) == 2
+
+    llm.fail = True
+    try:
+        asyncio.run(actor.update_weights_packed([("c", "bf16", (1,))]))
+    except RuntimeError as exc:
+        assert str(exc) == "broadcast failed"
+    else:
+        raise AssertionError("expected the fake collective to fail")
+    assert asyncio.run(actor.get_weight_version()) == 2

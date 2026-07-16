@@ -26,6 +26,7 @@ from molt.trainer.rollout.router import (
     RouterGenerateClient,
     _align_features_to_canonical,
     _decode_routed_experts,
+    _execute_runner_with_policy_audit,
 )
 
 GEN = "/inference/v1/generate"
@@ -258,3 +259,73 @@ def test_align_features_multi_image_finds_separated_runs():
 def test_decode_routed_experts_handles_both_encodings():
     assert _decode_routed_experts(_npy_b64([[1], [2]])).tolist() == [[1], [2]]  # base64 .npy
     assert _decode_routed_experts([[3], [4]]).tolist() == [[3], [4]]  # nested JSON lists
+
+
+class _RemoteVersionMethod:
+    def __init__(self, values):
+        self.values = iter(values)
+
+    def remote(self):
+        async def read():
+            return next(self.values)
+
+        return read()
+
+
+class _VersionSource:
+    def __init__(self, values):
+        self.get_weight_version = _RemoteVersionMethod(values)
+
+
+class _RecordingRunner:
+    def __init__(self):
+        self.kwargs = None
+
+    async def execute(self, **kwargs):
+        self.kwargs = kwargs
+        return [SimpleNamespace(extra_logs={"rollout_kind": "agent-owned-wrong-value"})]
+
+
+@pytest.mark.parametrize(
+    ("version_source", "policy_version", "policy_frozen", "expected_start", "expected_end", "expected_frozen"),
+    [
+        (_VersionSource([5, 6]), 99, True, 5, 6, 0.0),
+        (_VersionSource([7, 7]), 99, False, 7, 7, 1.0),
+        (None, 11, False, 11, -1, 0.0),
+        (None, 13, True, 13, 13, 1.0),
+    ],
+)
+def test_execute_runner_stamps_authoritative_policy_provenance(
+    version_source,
+    policy_version,
+    policy_frozen,
+    expected_start,
+    expected_end,
+    expected_frozen,
+):
+    runner = _RecordingRunner()
+    result = asyncio.run(
+        _execute_runner_with_policy_audit(
+            runner=runner,
+            version_source=version_source,
+            prompt="prompt",
+            label="label",
+            sampling_params=_sp(),
+            max_length=64,
+            hf_tokenizer=object(),
+            llm_engine=object(),
+            images=None,
+            rollout_kind="eval",
+            policy_version=policy_version,
+            policy_frozen=policy_frozen,
+        )
+    )
+
+    assert runner.kwargs["policy_version"] == expected_start
+    assert runner.kwargs["rollout_kind"] == "eval"
+    assert result[0].extra_logs == {
+        "rollout_kind": "eval",
+        "policy_version_start": expected_start,
+        "policy_version_end": expected_end,
+        "policy_frozen": expected_frozen,
+    }

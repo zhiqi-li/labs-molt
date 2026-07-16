@@ -102,6 +102,7 @@ class RolloutRayActor:
     """Async vLLM-backed actor that exposes generation utilities."""
 
     async def __init__(self, *args, bundle_indices: list = None, **kwargs):
+        self._weight_version = 0
         backend = kwargs.get("distributed_executor_backend")
         num_gpus = kwargs.pop("num_gpus")
         self._configure_device_env(
@@ -221,6 +222,7 @@ class RolloutRayActor:
             "update_weights_packed",
             args=(metas,),
         )
+        self._weight_version += 1
         return result
 
     async def reset_weight_update_check(self):
@@ -233,6 +235,10 @@ class RolloutRayActor:
         for r in results or []:
             missing.update(r or [])
         return sorted(missing)
+
+    async def get_weight_version(self):
+        """Monotonic version used to audit whether a rollout crossed a refit."""
+        return self._weight_version
 
     async def pause_generation(self):
         await self.llm.pause_generation(mode="keep")
@@ -292,6 +298,7 @@ def create_vllm_engines(
     enable_return_routed_experts: bool = False,
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
+    disable_custom_all_reduce: bool = False,
 ):
     """Spin up a set of vLLM Ray actors on a dedicated placement group.
 
@@ -408,6 +415,9 @@ def create_vllm_engines(
             "num_gpus": num_gpus,
             "worker_num_gpus": worker_num_gpus,
         }
+
+        if disable_custom_all_reduce:
+            actor_kwargs["disable_custom_all_reduce"] = True
 
         if max_images_per_prompt > 0:
             actor_kwargs["limit_mm_per_prompt"] = {"image": max_images_per_prompt}

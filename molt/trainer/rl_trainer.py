@@ -28,7 +28,9 @@ from molt.datasets import PromptDataset
 from molt.datasets.utils import blending_datasets
 from molt.trainer.algorithm.experience import balance_experiences
 from molt.trainer.algorithm.kl_controller import AdaptiveKLController, FixedKLController
+from molt.trainer.eval_schedule import async_eval_due
 from molt.trainer.fsdp import FsdpStrategy
+from molt.trainer.resume_state import resolve_rollout_resume_position
 from molt.trainer.rollout.experience_maker import RemoteExperienceMaker
 from molt.trainer.rollout.samples_generator import SamplesGenerator
 from molt.trainer.vllm.vllm_engine import batch_vllm_engine_call
@@ -42,6 +44,7 @@ logger = init_logger(__name__)
 
 def prepare_datasets(strategy, tokenizer):
     args = strategy.args
+    eval_only = bool(getattr(args.eval, "eval_only", False))
 
     # BOTH runner types consume the SAME chat-format dataset (--data.apply_chat_template);
     # Runner.PRERENDER_PROMPT only decides WHERE the template is applied. The step runner needs the
@@ -61,27 +64,34 @@ def prepare_datasets(strategy, tokenizer):
             "server renders them once with the model's own template."
         )
 
-    # prepare datasets
-    train_data = blending_datasets(
-        args.data.prompt_dataset,
-        args.data.prompt_probs,
-        strategy,
-        args.train.seed,
-        max_count=args.data.max_samples,
-        dataset_split=args.data.prompt_split,
-    )
+    if eval_only:
+        # Standalone checkpoint evaluation must not require a dummy training
+        # dataset. The training iterator is never touched in eval-only mode.
+        prompts_dataset = None
+        prompts_dataloader = None
+    else:
+        if not args.data.prompt_dataset:
+            raise ValueError("--data.prompt_dataset is required unless --eval.eval_only is set")
+        train_data = blending_datasets(
+            args.data.prompt_dataset,
+            args.data.prompt_probs,
+            strategy,
+            args.train.seed,
+            max_count=args.data.max_samples,
+            dataset_split=args.data.prompt_split,
+        )
 
-    # Create train dataset
-    train_data = train_data.select(range(min(args.data.max_samples, len(train_data))))
-    prompts_dataset = PromptDataset(train_data, tokenizer, strategy, prerender=prerender)
-    prompts_dataloader = strategy.setup_dataloader(
-        prompts_dataset,
-        batch_size=1,
-        pin_memory=True,
-        shuffle=True,
-        collate_fn=prompts_dataset.collate_fn,
-        num_workers=args.data.dataloader_num_workers,
-    )
+        # Create train dataset
+        train_data = train_data.select(range(min(args.data.max_samples, len(train_data))))
+        prompts_dataset = PromptDataset(train_data, tokenizer, strategy, prerender=prerender)
+        prompts_dataloader = strategy.setup_dataloader(
+            prompts_dataset,
+            batch_size=1,
+            pin_memory=True,
+            shuffle=not getattr(args.data, "disable_prompt_shuffle", False),
+            collate_fn=prompts_dataset.collate_fn,
+            num_workers=args.data.dataloader_num_workers,
+        )
 
     # Create eval dataset if eval data exists
     if getattr(args.eval, "dataset", None):
@@ -104,7 +114,11 @@ def prepare_datasets(strategy, tokenizer):
     else:
         eval_dataloader = None
 
-    if args.train.force_on_policy:
+    if eval_only:
+        # Model initialization still expects a positive scheduler horizon even
+        # though no optimizer step will run.
+        max_steps = 1
+    elif args.train.force_on_policy:
         # On-policy: one optimizer step per rollout batch (per epoch), regardless
         # of how many samples multi-turn flatten produces. The generator consumes
         # rollout.batch_size prompt-groups per round, so the LR scheduler decays
@@ -136,7 +150,9 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         return {}
 
     prompt_to_datasource = {}
+    expected_group_count = 0
     for datasources, prompts, labels, _images, _tools in eval_dataloader:
+        expected_group_count += len(prompts)
         for prompt, datasource in zip(prompts, datasources):
             if isinstance(prompt, list):
                 # Chat rows pass through as messages; key on the last user turn's text —
@@ -158,16 +174,24 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
     grouped: Dict[str, Dict[str, list]] = {}
     group_order = []
     group_prompt: Dict[str, str] = {}
+    global_info: Dict[str, list[float]] = {}
     for s in samples_list:
         prompt = s.prompts[0]
         key = s.group_ids[0] if getattr(s, "group_ids", None) else prompt
         if key not in grouped:
-            grouped[key] = {"rewards": [], "lengths": [], "truncated": []}
+            grouped[key] = {"rewards": [], "lengths": [], "truncated": [], "rollout_ids": set()}
             group_order.append(key)
             group_prompt[key] = prompt
         grouped[key]["rewards"].append(_first_scalar(s.rewards))
         grouped[key]["lengths"].append(_first_scalar(s.response_length))
         grouped[key]["truncated"].append(_first_scalar(s.truncated))
+        rollout_ids = getattr(s, "rollout_ids", None)
+        grouped[key]["rollout_ids"].add(rollout_ids[0] if rollout_ids else id(s))
+        sample_info = getattr(s, "info", None) or {}
+        for metric_name, metric_value in sample_info.items():
+            scalar = _first_scalar(metric_value)
+            if isinstance(scalar, (int, float, bool)):
+                global_info.setdefault(metric_name, []).append(float(scalar))
 
     metrics = {}
     for key in group_order:
@@ -209,9 +233,79 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         logs["eval_response_length_mean"] = sum(total_lengths) / len(total_lengths)
     if total_truncated:
         logs["eval_truncated_rate"] = sum(total_truncated) / len(total_truncated)
+    # Agent-specific metrics (e.g. gomoku_win/raw_reward/legal_rate) live in
+    # Experience.info. Expose global eval means so best-checkpoint selection can
+    # use the true task metric instead of the shaped training reward/pass1.
+    for metric_name, values in sorted(global_info.items()):
+        if values:
+            logs[f"eval_{metric_name}"] = sum(values) / len(values)
+
+    # Async evaluation can overlap a policy broadcast when partial rollouts are
+    # enabled.  A mean policy version hides that race: even one game generated
+    # across two versions makes the aggregate unsuitable for best-checkpoint
+    # selection.  Emit an explicit invariant that callers can enforce.
+    policy_starts = global_info.get("policy_version_start", [])
+    policy_ends = global_info.get("policy_version_end", [])
+    policy_frozen = global_info.get("policy_frozen", [])
+    logs["eval_policy_consistent"] = 0.0
+    if policy_starts or policy_ends:
+        policy_versions = policy_starts + policy_ends
+        logs["eval_policy_version_min"] = min(policy_versions)
+        logs["eval_policy_version_max"] = max(policy_versions)
+        logs["eval_policy_version_span"] = max(policy_versions) - min(policy_versions)
+        pairwise_consistent = (
+            len(policy_starts) == len(samples_list)
+            and len(policy_ends) == len(samples_list)
+            and len(policy_frozen) == len(samples_list)
+            and all(bool(value) for value in policy_frozen)
+            and all(start == end for start, end in zip(policy_starts, policy_ends))
+        )
+        logs["eval_policy_consistent"] = float(pairwise_consistent and logs["eval_policy_version_span"] == 0)
+
+    actual_group_count = len(grouped)
+    complete_group_count = sum(len(grouped[key]["rollout_ids"]) == n_samples_per_prompt for key in group_order)
+    actual_rollout_count = sum(len(grouped[key]["rollout_ids"]) for key in group_order)
+    logs["eval_group_count"] = float(actual_group_count)
+    logs["eval_expected_group_count"] = float(expected_group_count)
+    logs["eval_num_rollouts"] = float(actual_rollout_count)
+    logs["eval_expected_num_rollouts"] = float(expected_group_count * n_samples_per_prompt)
+    logs["eval_groups_complete"] = float(
+        actual_group_count == expected_group_count and complete_group_count == expected_group_count
+    )
+    logs["eval_backend_error_count"] = float(
+        sum(
+            any(
+                bool(_first_scalar((getattr(sample, "info", None) or {}).get(key)))
+                for key in ("nanobot_backend_error", "esibench_backend_error")
+            )
+            for sample in samples_list
+        )
+    )
     logs["eval_num_samples"] = float(len(samples_list))
 
     return logs
+
+
+def eval_matches_current_policy(eval_metrics, current_policy_versions) -> bool:
+    """Whether the actor/vLLM policy now resident is exactly the evaluated one."""
+    if not current_policy_versions or eval_metrics.get("eval_policy_consistent") != 1.0:
+        return False
+    eval_min = eval_metrics.get("eval_policy_version_min")
+    eval_max = eval_metrics.get("eval_policy_version_max")
+    if eval_min is None or eval_max is None or eval_min != eval_max:
+        return False
+    return all(float(version) == float(eval_min) for version in current_policy_versions)
+
+
+def eval_is_checkpoint_safe(eval_metrics) -> bool:
+    """Fail-closed gate for selecting a best checkpoint from asynchronous eval."""
+    return bool(
+        eval_metrics
+        and eval_metrics.get("eval_policy_consistent") == 1.0
+        and eval_metrics.get("eval_checkpoint_policy_matches") == 1.0
+        and eval_metrics.get("eval_groups_complete") == 1.0
+        and eval_metrics.get("eval_backend_error_count") == 0.0
+    )
 
 
 class BaseRLTrainer:
@@ -441,6 +535,20 @@ class BaseRLTrainer:
         if not eval_metrics or self.best_eval_metric_key == "none":
             return
 
+        if not eval_is_checkpoint_safe(eval_metrics):
+            logger.warning(
+                "Skipping best-checkpoint selection: policy_consistent=%s, "
+                "checkpoint_policy_matches=%s, groups_complete=%s, backend_errors=%s "
+                "(eval versions min=%s max=%s).",
+                eval_metrics.get("eval_policy_consistent"),
+                eval_metrics.get("eval_checkpoint_policy_matches"),
+                eval_metrics.get("eval_groups_complete"),
+                eval_metrics.get("eval_backend_error_count"),
+                eval_metrics.get("eval_policy_version_min"),
+                eval_metrics.get("eval_policy_version_max"),
+            )
+            return
+
         if self.best_eval_metric_key:
             metric_key = self.best_eval_metric_key if self.best_eval_metric_key in eval_metrics else None
         else:
@@ -561,6 +669,7 @@ class GenerateSamplesActor:
         rollout_queue,
         rollout_slots,
         router_url=None,
+        version_source=None,
         **generate_kwargs,
     ):
         # No vllm_engines here: generation runs through the vllm-router via the runner
@@ -577,7 +686,12 @@ class GenerateSamplesActor:
 
         num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
         agent_runners = [
-            AgentRunnerActor.remote(strategy.args.train.agent_path, router_url, model_path=pretrain)
+            AgentRunnerActor.remote(
+                strategy.args.train.agent_path,
+                router_url,
+                model_path=pretrain,
+                version_source=version_source,
+            )
             for _ in range(num_runners)
         ]
         ray.get([r.ready.remote() for r in agent_runners])
@@ -603,6 +717,7 @@ class GenerateSamplesActor:
         # resume starts at a saved global_step > 0, so this never adds a redundant
         # eval on resume.
         self._eval_at_start = getattr(strategy.args.eval, "eval_at_start", False)
+        self._eval_only = getattr(strategy.args.eval, "eval_only", False)
 
     def get_max_steps(self):
         return self.max_steps
@@ -613,6 +728,33 @@ class GenerateSamplesActor:
 
     def fit(self, episode: int, total_consumed_prompts: int) -> None:
         eval_steps = self.args.eval.steps
+        if self._eval_only:
+            if self.eval_dataloader is None:
+                raise ValueError("eval-only mode requires an evaluation dataset")
+            global_step = self.rollout_slots.get(block=True)
+            logger.info("Starting frozen-policy eval-only generation...")
+            eval_kwargs = {
+                **self.generate_kwargs,
+                "temperature": self.args.eval.temperature,
+                "n_samples_per_prompt": self.args.eval.n_samples_per_prompt,
+                "rollout_kind": "eval",
+                "policy_version": global_step,
+                "policy_frozen": True,
+            }
+            if not self._partial_rollout:
+                ray.get(self.vllm_lock.acquire.remote())
+            try:
+                samples_list = self.samples_generator.generate_eval_samples(**eval_kwargs)
+            finally:
+                if not self._partial_rollout:
+                    ray.get(self.vllm_lock.release.remote())
+            eval_metrics = compute_eval_metrics(
+                self.eval_dataloader, samples_list, self.args.eval.n_samples_per_prompt
+            )
+            logger.info(f"Frozen-policy eval-only completed: {eval_metrics}")
+            self.rollout_queue.put(("eval", global_step, eval_metrics), block=True)
+            self.rollout_queue.put("done", block=True)
+            return
         # eval_at_start must fire only on a genuinely FRESH run. The
         # GenerateSamplesActor transiently reads global_step 0 at startup even on
         # resume (the restored step propagates through rollout_slots a beat later),
@@ -657,18 +799,13 @@ class GenerateSamplesActor:
                     self._next_eval_step = (global_step // eval_steps + 1) * eval_steps
                     eval_synced = True
 
-                should_eval = (
-                    self.eval_dataloader is not None
-                    and eval_steps != float("inf")
-                    and global_step != self._last_eval_step
-                    and (
-                        global_step >= self._next_eval_step
-                        if global_step > 0
-                        # step-0 baseline (fresh run only): measure the pre-RL model
-                        # so later gains are attributable. After it fires, the normal
-                        # cadence resumes (_next_eval_step advances to eval_steps).
-                        else (self._eval_at_start and self._last_eval_step < 0 and fresh_start)
-                    )
+                should_eval = self.eval_dataloader is not None and async_eval_due(
+                    global_step=global_step,
+                    last_eval_step=self._last_eval_step,
+                    next_eval_step=self._next_eval_step,
+                    eval_steps=eval_steps,
+                    eval_at_start=self._eval_at_start,
+                    fresh_start=fresh_start,
                 )
                 if should_eval:
                     self._last_eval_step = global_step
@@ -684,6 +821,11 @@ class GenerateSamplesActor:
                         override = getattr(self.args.eval, key)
                         if override is not None:
                             eval_kwargs[key] = override
+                    eval_kwargs.update(
+                        rollout_kind="eval",
+                        policy_version=global_step,
+                        policy_frozen=not self._partial_rollout,
+                    )
                     # Under partial rollout the rollout path (below) deliberately
                     # skips vllm_lock so the trainer's broadcast_to_vllm refit can
                     # interleave via pause/resume. Eval must follow the same
@@ -720,8 +862,17 @@ class GenerateSamplesActor:
                         ray.get(self.vllm_lock.acquire.remote())
                     try:
                         t0 = time.time()
+                        train_kwargs = {
+                            **self.generate_kwargs,
+                            "rollout_kind": "train",
+                            "policy_version": global_step,
+                            # Streaming generation returns before its slow refill tail
+                            # drains, so those in-flight requests can cross the next
+                            # refit even when the outer lock guarded this batch.
+                            "policy_frozen": False,
+                        }
                         rollout_samples, rollout_metrics, prompts_consumed, is_exhausted = (
-                            self.samples_generator.generate_samples(**self.generate_kwargs)
+                            self.samples_generator.generate_samples(**train_kwargs)
                         )
                         generation_time = time.time() - t0
                         total_consumed_prompts += prompts_consumed
@@ -806,6 +957,18 @@ class TrainingActor(BaseRLTrainer):
             if payload[0] == "eval":
                 _, eval_step, eval_metrics = payload
                 self.rollout_slots.put(global_step, block=True)
+                eval_metrics = dict(eval_metrics)
+                current_policy_versions = (
+                    ray.get([engine.get_weight_version.remote() for engine in self.vllm_engines])
+                    if self.vllm_engines
+                    else []
+                )
+                if current_policy_versions:
+                    eval_metrics["eval_checkpoint_policy_version_min"] = float(min(current_policy_versions))
+                    eval_metrics["eval_checkpoint_policy_version_max"] = float(max(current_policy_versions))
+                eval_metrics["eval_checkpoint_policy_matches"] = float(
+                    eval_matches_current_policy(eval_metrics, current_policy_versions)
+                )
                 logger.info(f"Eval at step {eval_step}: {eval_metrics}")
                 if self.wandb_logger:
                     self.wandb_logger.log_eval(eval_step, eval_metrics)
@@ -880,6 +1043,19 @@ class TrainingActor(BaseRLTrainer):
             self._broadcast_transfer_s = time.time() - _t0
 
 
+def reseed_rollout_slots(rollout_slots, queue_size: int, global_step: int) -> None:
+    """Replace constructor-time slot values before either worker starts.
+
+    On checkpoint resume the queues still contain zeros from ``RLTrainer``
+    construction. Replacing every token ensures eval-only and the first resumed
+    rollout carry the restored step rather than being mislabeled as policy 0.
+    """
+    for _ in range(queue_size):
+        rollout_slots.get(block=True)
+    for _ in range(queue_size):
+        rollout_slots.put(int(global_step), block=True)
+
+
 @ray.remote
 class RLTrainer:
     """Async-only RL controller."""
@@ -904,6 +1080,8 @@ class RLTrainer:
         if queue_size <= 0:
             raise ValueError(f"async_queue_size must be positive, got {queue_size}")
         logger.info(f"async_queue_size={queue_size}")
+        self._queue_size = queue_size
+        self._eval_only = bool(getattr(strategy.args.eval, "eval_only", False))
 
         self.rollout_queue = Queue(maxsize=queue_size)
         self.rollout_slots = Queue(maxsize=queue_size)
@@ -919,6 +1097,7 @@ class RLTrainer:
             rollout_queue=self.rollout_queue,
             rollout_slots=self.rollout_slots,
             router_url=router_url,
+            version_source=vllm_engines[0] if vllm_engines else None,
             **generate_kwargs,
         )
 
@@ -940,19 +1119,31 @@ class RLTrainer:
 
         # .get with defaults: an interrupted save can leave model/ without extra_state.pt, so
         # load_ckpt returns states={} (weights load, scalars empty) — resume at 0, not KeyError.
-        start_episode = checkpoint_states.get("episode", 0)
+        start_episode, resume_dataloader_state = resolve_rollout_resume_position(checkpoint_states)
         global_step = checkpoint_states.get("global_step", 0)
         total_consumed_prompts = checkpoint_states.get("total_consumed_prompts", 0)
         if global_step > 0:
-            ray.get(
-                [
+            resume_refs = [
+                self.trainer_actor.broadcast_to_vllm.remote(),
+            ]
+            if self._eval_only:
+                logger.info("eval-only resume: skipping training dataloader state restoration")
+            elif resume_dataloader_state is not None:
+                resume_refs.append(
                     self.generator_actor.load_dataloader_state_dict.remote(
-                        checkpoint_states["data_loader_state_dict"],
+                        resume_dataloader_state,
                         checkpoint_states.get("rollout_generator_state_dict"),
-                    ),
-                    self.trainer_actor.broadcast_to_vllm.remote(),
-                ]
-            )
+                    )
+                )
+            else:
+                logger.info(
+                    "checkpoint dataloader finished episode %s; resuming at episode %s with a fresh iterator",
+                    checkpoint_states.get("episode", 0),
+                    start_episode,
+                )
+            ray.get(resume_refs)
+
+        reseed_rollout_slots(self.rollout_slots, self._queue_size, global_step)
 
         ray.get(
             [

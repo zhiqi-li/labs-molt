@@ -15,6 +15,7 @@
 
 import sys
 import types
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -45,10 +46,13 @@ if "ray" not in sys.modules:
     fake_scheduling = types.ModuleType("ray.util.scheduling_strategies")
     fake_scheduling.PlacementGroupSchedulingStrategy = type("PlacementGroupSchedulingStrategy", (), {})
     fake_util.scheduling_strategies = fake_scheduling
+    fake_queue = types.ModuleType("ray.util.queue")
+    fake_queue.Queue = MagicMock()
     fake_ray.util = fake_util
     sys.modules["ray"] = fake_ray
     sys.modules["ray.util"] = fake_util
     sys.modules["ray.util.placement_group"] = fake_placement_group
+    sys.modules["ray.util.queue"] = fake_queue
     sys.modules["ray.util.scheduling_strategies"] = fake_scheduling
 if "vllm" not in sys.modules:
     fake_vllm = types.ModuleType("vllm")
@@ -152,6 +156,39 @@ def test_generate_samples_pool_persists_across_calls(monkeypatch):
     assert [sample.group_ids[0] for sample in second] == ["p3", "p4", "p5"]
     assert prompts_dispatched == 3  # only the 3 refills, not a fresh batch of 5
     assert [handle.group_id for handle in generator._inflight_rollouts] == ["p6", "p7", "p8", "p9"]
+
+
+def test_generate_samples_drains_tail_before_starting_next_episode(monkeypatch):
+    """Exhausting the iterator must not restart it while a slow tail remains.
+
+    Seven prompts with a five-prompt in-flight pool and three-prompt train batch
+    leave p6 in flight after the second update.  The old lifecycle keyed only on
+    ``_dataloader_iter is None`` dropped p6 and restarted at p0 on the next call,
+    making the outer episode loop run past 100% forever.
+    """
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=1, vllm_generate_batch_size=5),
+        algo=SimpleNamespace(dynamic_filtering_enable=False),
+    )
+    generator.prompts_dataloader = _prompt_loader(7)
+    _wire_fake_vllm(generator, monkeypatch, _sample)
+
+    first, _, first_dispatched, first_exhausted = generator.generate_samples()
+    second, _, second_dispatched, second_exhausted = generator.generate_samples()
+    tail, _, tail_dispatched, tail_exhausted = generator.generate_samples()
+
+    assert [sample.group_ids[0] for sample in first] == ["p0", "p1", "p2"]
+    assert [sample.group_ids[0] for sample in second] == ["p3", "p4", "p5"]
+    assert [sample.group_ids[0] for sample in tail] == ["p6"]
+    assert (first_dispatched, second_dispatched, tail_dispatched) == (7, 0, 0)
+    assert (first_exhausted, second_exhausted, tail_exhausted) == (False, False, True)
+
+    # Only after the tail reports exhaustion does the following outer episode
+    # start a fresh iterator at p0.
+    next_episode, _, _, next_exhausted = generator.generate_samples()
+    assert [sample.group_ids[0] for sample in next_episode] == ["p0", "p1", "p2"]
+    assert next_exhausted is False
 
 
 def test_generator_keeps_no_checkpoint_state_and_resumes_from_dataloader(monkeypatch):
@@ -291,3 +328,93 @@ def test_process_response_skips_misaligned_rollout_logprobs():
 
     assert experience is None
     assert drop_reason == "logprob_misalign"
+
+
+def test_process_response_drops_backend_errors_only_from_training():
+    generator = object.__new__(SamplesGenerator)
+    trajectory = Trajectory(
+        prompt="p",
+        label="l",
+        images=None,
+        observation_text="",
+        observation_tokens=[0, 1, 2],
+        action_ranges=[(1, 3)],
+        rollout_log_probs=[0.0, 0.0, 0.0],
+        reward=0.0,
+        scores=0.0,
+        extra_logs={"nanobot_backend_error": True, "esibench_backend_error": True},
+    )
+
+    experience, drop_reason = generator._process_response_into_experience(trajectory, max_len=8, rollout_kind="train")
+    assert experience is None
+    assert drop_reason == "backend_error"
+
+    # Eval must retain the row so exact-count/backend-error audits can see and
+    # reject it instead of silently reporting a cleaner metric.
+    experience, drop_reason = generator._process_response_into_experience(trajectory, max_len=8, rollout_kind="eval")
+    assert experience is not None
+    assert drop_reason is None
+    assert experience.info["nanobot_backend_error"].item() is True
+
+
+def test_filter_group_drops_all_training_siblings_after_one_backend_error(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(rollout=SimpleNamespace(n_samples_per_prompt=4))
+    responses = [SimpleNamespace(i=i) for i in range(4)]
+
+    def process(response, **_kwargs):
+        if response.i == 1:
+            return None, "backend_error"
+        return SimpleNamespace(rollout_ids=[f"r{response.i}"], scores=torch.tensor([0.0])), None
+
+    generator._process_response_into_experience = process
+    monkeypatch.setattr(samples_generator.ray, "get", lambda _ref: responses)
+    # defaultdict is the production type; use it here to assert exact tallies.
+    drop_counts = defaultdict(int)
+    kept = generator._filter_group(
+        object(),
+        dynamic_filtering=False,
+        drop_counts=drop_counts,
+        rollout_kind="train",
+        n_samples_per_prompt=4,
+    )
+
+    assert kept == []
+    assert dict(drop_counts) == {"backend_error": 1, "incomplete_group": 3}
+
+
+def test_dispatch_forwards_rollout_and_policy_metadata():
+    calls = []
+
+    class RemoteRunGroup:
+        @staticmethod
+        def remote(*args, **kwargs):
+            calls.append((args, kwargs))
+            return "ref"
+
+    actor = SimpleNamespace(run_group=RemoteRunGroup())
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(n_samples_per_prompt=4),
+        algo=SimpleNamespace(advantage=SimpleNamespace(is_correction_enable=False)),
+    )
+    generator.agent_runners = [actor]
+    generator._rr = 0
+
+    refs = generator._dispatch_to_agent_runners(
+        ["p"],
+        ["l"],
+        images=[None],
+        max_len=128,
+        n_samples_per_prompt=4,
+        rollout_kind="eval",
+        policy_version=17,
+        policy_frozen=True,
+    )
+
+    assert refs == ["ref"]
+    args, kwargs = calls[0]
+    assert args[0:3] == ("p", "l", None)
+    assert args[4:] == (128, 4)
+    assert kwargs["tools"] is None
+    assert (kwargs["rollout_kind"], kwargs["policy_version"], kwargs["policy_frozen"]) == ("eval", 17, True)

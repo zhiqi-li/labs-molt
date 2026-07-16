@@ -252,14 +252,25 @@ def make_experience_batch(items: List[Experience]) -> Experience:
                 raise ValueError(f"Unsupported tensor field batching rule for {f.name}")
         elif isinstance(first, dict):
             kwargs[f.name] = {}
-            for key in first.keys():
+            mappings = [getattr(item, f.name) for item in items]
+            if not all(isinstance(mapping, dict) for mapping in mappings):
+                raise TypeError(f"Inconsistent types in {f.name}")
+            # Per-environment logging dictionaries can contain sparse metrics
+            # (for example only the current ESI-Bench task's task-specific
+            # counters).  A batch has one value per sample, so only keys present
+            # for every item can be represented without turning "not applicable"
+            # into a misleading numeric zero.
+            common_keys = set.intersection(*(set(mapping) for mapping in mappings))
+            for key in sorted(common_keys):
                 vals = [getattr(item, f.name)[key] for item in items]
                 if not vals:
                     continue
                 first_type = type(vals[0])
                 if not all(isinstance(v, first_type) for v in vals):
                     raise TypeError(f"Inconsistent types in {f.name}[{key}]")
-                if all(isinstance(v, (int, float)) for v in vals):
+                if all(isinstance(v, torch.Tensor) for v in vals):
+                    kwargs[f.name][key] = torch.stack(vals)
+                elif all(isinstance(v, (int, float)) for v in vals):
                     kwargs[f.name][key] = torch.tensor(vals)
                 else:
                     kwargs[f.name][key] = vals
@@ -316,6 +327,28 @@ def balance_experiences(experiences, args):
             f"divides evenly across {effective_num} DP ranks."
         )
         items_all = items_all[:-remainder]
+
+    # Every DP rank enters the same all_reduce over its metric dictionary in
+    # PolicyModelActor._record_status, so all partitions must carry the exact
+    # same keys.  Keep the global intersection before partitioning.  Sparse
+    # task-only metrics remain available in the trajectory log/eval report, but
+    # are intentionally omitted from this mixed-task optimization batch rather
+    # than being imputed as zero (which would corrupt their means).
+    for f in fields(Experience):
+        mappings = [getattr(item, f.name) for item in items_all]
+        if not mappings or not all(isinstance(mapping, dict) for mapping in mappings):
+            continue
+        common_keys = set.intersection(*(set(mapping) for mapping in mappings))
+        all_keys = set.union(*(set(mapping) for mapping in mappings))
+        sparse_keys = sorted(all_keys - common_keys)
+        if sparse_keys:
+            logger.warning(
+                "[balance_experiences] dropping sparse per-sample keys from %s: %s",
+                f.name,
+                sparse_keys,
+            )
+            for item, mapping in zip(items_all, mappings):
+                setattr(item, f.name, {key: mapping[key] for key in common_keys})
 
     lengths = [
         int(item.total_length.item() if isinstance(item.total_length, torch.Tensor) else item.total_length)
