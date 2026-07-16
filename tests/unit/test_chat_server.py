@@ -60,8 +60,11 @@ class _FakeTransport:
 
 def _proc():
     # apply_chat_template output is fed to the monkeypatched _tokenize_observation, so its value is
-    # irrelevant; image_token == "<image>" -> should_expand is False (no structured-content split).
-    return SimpleNamespace(apply_chat_template=lambda chat, **k: "TEXT", image_token="<image>")
+    # otherwise irrelevant. Preserve literal image markers so alignment checks remain realistic.
+    def render(chat, **_kwargs):
+        return "".join(str(message.get("content") or "") for message in chat) + "TEXT"
+
+    return SimpleNamespace(apply_chat_template=render, image_token="<image>")
 
 
 def _sampling(max_tokens=8):
@@ -379,6 +382,7 @@ def test_run_turn_raises_on_logprobs_count_mismatch(monkeypatch):
 
 def test_run_turn_vlm_carries_pixel_values(monkeypatch):
     _patch_prompts(monkeypatch, [[999, 999, 7]], mm={"pixel_values": np.ones((1, 3, 4, 4))}, pil=["PIL"])
+    monkeypatch.setattr(cs, "load_images", lambda _url: ["PIL"])
     monkeypatch.setattr(cs, "estimate_vllm_input_expansion_delta", lambda *a, **k: 5)
     state, tp = _state([_act([90], [-0.1])])
     state.open("sid", "P", "l", None)
@@ -388,6 +392,98 @@ def test_run_turn_vlm_carries_pixel_values(monkeypatch):
     assert traj.observation_tokens[:3] == [999, 999, 7]
     assert traj.mm_train_inputs["pixel_values"].shape[0] == 1 and traj.image_budget == 5
     assert tp.calls[0][1] == {"image": ["PIL"]}  # images forwarded to generate as multi_modal_data
+
+
+class _StructuredImageProcessor:
+    image_token = "<|image_pad|>"
+
+    def __init__(self):
+        self.rendered_chat = None
+
+    def apply_chat_template(self, chat, **_kwargs):
+        self.rendered_chat = chat
+        rendered = []
+        for message in chat:
+            content = message["content"]
+            if isinstance(content, str):
+                rendered.append(content)
+                continue
+            for block in content:
+                if block.get("type") == "image":
+                    rendered.append(self.image_token)
+                elif block.get("type") == "text":
+                    rendered.append(block.get("text") or "")
+        return "".join(rendered)
+
+
+def _image_url(url):
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def test_structured_template_does_not_promote_literal_image_text(monkeypatch):
+    monkeypatch.setattr(cs, "load_images", lambda url: [f"PIL:{url}"])
+    captured = {}
+
+    def tokenize(processor, prompt_text, images):
+        captured["prompt_text"] = prompt_text
+        captured["images"] = list(images)
+        return [1, 2], None, images
+
+    monkeypatch.setattr(cs, "_tokenize_observation", tokenize)
+    processor = _StructuredImageProcessor()
+    state = ChatServerState(_FakeTransport([_act([90], [-0.1])]), processor, "policy", 1000, _sampling())
+    state.open("sid", "P", "l", None)
+    body = {
+        "messages": [
+            {"role": "user", "content": [_image_url("frame-1"), _image_url("frame-2")]},
+            {"role": "assistant", "content": "The literal marker <image> is text."},
+            {"role": "user", "content": [_image_url("frame-3")]},
+        ]
+    }
+
+    asyncio.run(_run_turn(state, state.sessions["sid"], body))
+
+    assert processor.rendered_chat[1]["content"] == "The literal marker <image> is text."
+    assert captured["prompt_text"].count(processor.image_token) == 3
+    assert captured["images"] == ["PIL:frame-1", "PIL:frame-2", "PIL:frame-3"]
+
+
+def test_run_turn_rejects_rendered_placeholder_image_mismatch(monkeypatch):
+    monkeypatch.setattr(cs, "load_images", lambda url: [f"PIL:{url}"])
+    processor = _StructuredImageProcessor()
+    state = ChatServerState(_FakeTransport([]), processor, "policy", 1000, _sampling())
+    state.open("sid", "P", "l", None)
+    body = {
+        "messages": [
+            {"role": "user", "content": [_image_url("frame-1")]},
+            {"role": "assistant", "content": f"orphan token: {processor.image_token}"},
+        ]
+    }
+
+    with pytest.raises(ValueError, match=r"rendered_placeholders=2, loaded_images=1"):
+        asyncio.run(_run_turn(state, state.sessions["sid"], body))
+
+    assert state.transport.calls == []
+    assert state.sessions["sid"].trajectories == []
+
+
+def test_run_turn_rejects_unloadable_image_before_render_or_generate(monkeypatch):
+    monkeypatch.setattr(cs, "load_images", lambda _url: [])
+    processor = _StructuredImageProcessor()
+    state = ChatServerState(_FakeTransport([]), processor, "policy", 1000, _sampling())
+    state.open("sid", "P", "l", None)
+
+    with pytest.raises(ValueError, match="image_url content block could not be loaded"):
+        asyncio.run(
+            _run_turn(
+                state,
+                state.sessions["sid"],
+                {"messages": [{"role": "user", "content": [_image_url("broken")]}]},
+            )
+        )
+
+    assert processor.rendered_chat is None
+    assert state.transport.calls == []
 
 
 def test_multiturn_vlm_carries_image_and_absorbs_a_new_one(monkeypatch):
