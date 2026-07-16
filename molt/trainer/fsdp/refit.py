@@ -19,11 +19,13 @@ Owns *how* to materialize each pushed parameter (``gather_full_param``): under
 FSDP2, params are ``DTensor`` instances whose ``.full_tensor()`` gathers the
 unsharded tensor across both FSDP shard and TP shard dims in one call.
 
-The sender (``trainer/workers/policy_actor.py``) pushes every ``state_dict``
-entry — vLLM's ``load_weights`` matches by name and ignores what it doesn't have,
-so the "which weights to accept" decision lives on the vLLM side.
+The sender (``trainer/workers/policy_actor.py``) pushes every canonical
+``state_dict`` entry, skipping only aliases proven to share the same tied
+parameter with a present source. vLLM's ``load_weights`` matches the remaining
+entries by name and decides which weights it accepts.
 """
 
+from collections.abc import Mapping
 from typing import Optional, Tuple
 
 import torch
@@ -49,3 +51,43 @@ def gather_full_param(param: torch.Tensor, dtype: Optional[torch.dtype] = None) 
     if dtype is not None and full.is_floating_point():
         full = full.to(dtype=dtype)
     return full, full.shape
+
+
+def redundant_tied_weight_aliases(model: torch.nn.Module, state_dict: Mapping[str, object]) -> set[str]:
+    """Return output aliases that duplicate an explicitly mapped tied weight.
+
+    Modern Transformers models expose ``all_tied_weights_keys`` (or the class
+    fallback ``_tied_weights_keys``) as an alias-to-source mapping.  For
+    example, Qwen3-VL maps ``lm_head.weight`` to
+    ``model.language_model.embed_tokens.weight``.  vLLM intentionally ignores
+    the former when ``tie_word_embeddings`` is enabled, because loading the
+    embedding source updates the shared output head too.  Sending that final
+    alias in its own packed flush therefore produces a misleading ``loaded
+    0/1`` warning even though the policy refit succeeded.
+
+    Only skip an alias when both sides of an explicit mapping are present in
+    this exact state dict.  Older list/regex forms are left untouched because
+    they do not identify which entry is the authoritative source.
+    """
+    tied_keys = getattr(model, "all_tied_weights_keys", None)
+    if tied_keys is None:
+        tied_keys = getattr(model, "_tied_weights_keys", None)
+    if not isinstance(tied_keys, Mapping):
+        return set()
+    aliases: set[str] = set()
+    for alias, source in tied_keys.items():
+        if (
+            not isinstance(alias, str)
+            or not isinstance(source, str)
+            or alias == source
+            or alias not in state_dict
+            or source not in state_dict
+        ):
+            continue
+        try:
+            is_same_parameter = model.get_parameter(alias) is model.get_parameter(source)
+        except (AttributeError, KeyError):
+            is_same_parameter = False
+        if is_same_parameter:
+            aliases.add(alias)
+    return aliases
