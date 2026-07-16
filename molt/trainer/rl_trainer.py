@@ -174,30 +174,73 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
     grouped: Dict[str, Dict[str, list]] = {}
     group_order = []
     group_prompt: Dict[str, str] = {}
+    # Chat rollouts can emit multiple trainable segments for one terminal episode.
+    # Keep raw info for fail-closed invariants, but log terminal metrics once per rollout.
     global_info: Dict[str, list[float]] = {}
+    raw_info: Dict[str, list[float]] = {}
+    rollout_info: Dict[str, Dict[object, float]] = {}
     for s in samples_list:
         prompt = s.prompts[0]
         key = s.group_ids[0] if getattr(s, "group_ids", None) else prompt
         if key not in grouped:
-            grouped[key] = {"rewards": [], "lengths": [], "truncated": [], "rollout_ids": set()}
+            grouped[key] = {
+                "rewards": {},
+                "lengths": {},
+                "truncated": {},
+                "rollout_ids": set(),
+            }
             group_order.append(key)
             group_prompt[key] = prompt
-        grouped[key]["rewards"].append(_first_scalar(s.rewards))
-        grouped[key]["lengths"].append(_first_scalar(s.response_length))
-        grouped[key]["truncated"].append(_first_scalar(s.truncated))
         rollout_ids = getattr(s, "rollout_ids", None)
-        grouped[key]["rollout_ids"].add(rollout_ids[0] if rollout_ids else id(s))
+        rollout_id = rollout_ids[0] if rollout_ids else id(s)
+        grouped[key]["rollout_ids"].add(rollout_id)
+
+        # stitch_session emits one Experience per trainable segment and copies
+        # the terminal reward to each. Core eval statistics must operate on
+        # trajectories, not weight long multi-turn rollouts by segment count.
+        reward = _first_scalar(s.rewards)
+        if reward is not None:
+            previous = grouped[key]["rewards"].get(rollout_id)
+            if previous is not None and reward != previous:
+                raise ValueError(
+                    f"Inconsistent rewards for eval rollout {rollout_id!r}: {previous!r} != {reward!r}"
+                )
+            grouped[key]["rewards"].setdefault(rollout_id, reward)
+        length = _first_scalar(s.response_length)
+        if length is not None:
+            grouped[key]["lengths"][rollout_id] = grouped[key]["lengths"].get(rollout_id, 0.0) + length
+        truncated = _first_scalar(s.truncated)
+        if truncated is not None:
+            grouped[key]["truncated"][rollout_id] = max(
+                grouped[key]["truncated"].get(rollout_id, 0.0), truncated
+            )
         sample_info = getattr(s, "info", None) or {}
         for metric_name, metric_value in sample_info.items():
             scalar = _first_scalar(metric_value)
             if isinstance(scalar, (int, float, bool)):
-                global_info.setdefault(metric_name, []).append(float(scalar))
+                scalar = float(scalar)
+                raw_info.setdefault(metric_name, []).append(scalar)
+                by_rollout = rollout_info.setdefault(metric_name, {})
+                if metric_name == "response_clip_ratio" or metric_name.endswith("_backend_error"):
+                    # These flags may be segment-local. A single affected segment
+                    # makes the terminal rollout affected.
+                    by_rollout[rollout_id] = max(by_rollout.get(rollout_id, 0.0), scalar)
+                else:
+                    # stitch_session copies terminal reward/info to every segment
+                    # of a rollout. Count the first copy only so the metric is not
+                    # biased by variable turn/segment counts.
+                    by_rollout.setdefault(rollout_id, scalar)
+
+    global_info = {
+        metric_name: list(values_by_rollout.values())
+        for metric_name, values_by_rollout in rollout_info.items()
+    }
 
     metrics = {}
     for key in group_order:
         g = grouped[key]
         prompt = group_prompt[key]
-        rewards = [r for r in g["rewards"] if r is not None]
+        rewards = list(g["rewards"].values())
         if not rewards:
             continue
         ds = prompt_to_datasource.get(prompt, "unknown")
@@ -213,8 +256,8 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
             metrics[ds][f"pass{n_samples_per_prompt}"] += max(rewards)
         metrics[ds]["pass1"] += sum(rewards) / len(rewards)
         metrics[ds]["count"] += 1
-        metrics[ds]["lengths"].extend(x for x in g["lengths"] if x is not None)
-        metrics[ds]["truncated"].extend(t for t in g["truncated"] if t is not None)
+        metrics[ds]["lengths"].extend(g["lengths"].values())
+        metrics[ds]["truncated"].extend(g["truncated"].values())
 
     logs = {}
     total_lengths = []
@@ -244,9 +287,9 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
     # enabled.  A mean policy version hides that race: even one game generated
     # across two versions makes the aggregate unsuitable for best-checkpoint
     # selection.  Emit an explicit invariant that callers can enforce.
-    policy_starts = global_info.get("policy_version_start", [])
-    policy_ends = global_info.get("policy_version_end", [])
-    policy_frozen = global_info.get("policy_frozen", [])
+    policy_starts = raw_info.get("policy_version_start", [])
+    policy_ends = raw_info.get("policy_version_end", [])
+    policy_frozen = raw_info.get("policy_frozen", [])
     logs["eval_policy_consistent"] = 0.0
     if policy_starts or policy_ends:
         policy_versions = policy_starts + policy_ends
@@ -257,7 +300,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
             len(policy_starts) == len(samples_list)
             and len(policy_ends) == len(samples_list)
             and len(policy_frozen) == len(samples_list)
-            and all(bool(value) for value in policy_frozen)
+            and all(value == 1.0 for value in policy_frozen)
             and all(start == end for start, end in zip(policy_starts, policy_ends))
         )
         logs["eval_policy_consistent"] = float(pairwise_consistent and logs["eval_policy_version_span"] == 0)
@@ -272,15 +315,12 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
     logs["eval_groups_complete"] = float(
         actual_group_count == expected_group_count and complete_group_count == expected_group_count
     )
-    logs["eval_backend_error_count"] = float(
-        sum(
-            any(
-                bool(_first_scalar((getattr(sample, "info", None) or {}).get(key)))
-                for key in ("nanobot_backend_error", "esibench_backend_error")
-            )
-            for sample in samples_list
+    backend_error_rollouts = set()
+    for key in ("nanobot_backend_error", "esibench_backend_error"):
+        backend_error_rollouts.update(
+            rollout_id for rollout_id, value in rollout_info.get(key, {}).items() if bool(value)
         )
-    )
+    logs["eval_backend_error_count"] = float(len(backend_error_rollouts))
     logs["eval_num_samples"] = float(len(samples_list))
 
     return logs
