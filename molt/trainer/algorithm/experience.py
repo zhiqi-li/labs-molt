@@ -116,6 +116,10 @@ class Experience:
     labels: list[str] = field(default_factory=list)
     images: list = field(default_factory=list)  # per-sample image paths/URLs for VLM (None entries for text-only)
     mm_train_inputs: list = field(default_factory=list)  # per-sample processor outputs (pixel_values dicts) for VLM
+    # Transport-only descriptions of compacted multimodal processor outputs.
+    # The trainer rebuilds and validates them from lossless PIL observations,
+    # then clears this field before any model forward or batch concatenation.
+    mm_train_input_specs: list = field(default_factory=list)
     info: dict = field(default_factory=dict)  # per-sample metrics for logging
     # GRPO grouping identity. `group_ids` (= prompt id) is shared by all N rollouts of one
     # prompt — the trainer averages their rewards to form the baseline. `rollout_ids` is

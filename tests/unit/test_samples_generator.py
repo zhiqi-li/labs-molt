@@ -63,6 +63,7 @@ if "vllm" not in sys.modules:
 from molt.agents.base import Trajectory
 from molt.trainer.rollout import samples_generator
 from molt.trainer.rollout.samples_generator import SamplesGenerator
+from molt.trainer.rollout.samples_generator import EvalExperience, _compact_eval_experience
 
 
 def _sample(group_id):
@@ -91,26 +92,75 @@ def _wire_fake_vllm(generator, monkeypatch, to_sample):
     monkeypatch.setattr(samples_generator.ray, "get", lambda handle: [handle])
 
 
-def test_generate_eval_samples_uses_independent_eval_batch_size():
+def test_generate_eval_samples_refills_independent_eval_pool(monkeypatch):
     generator = object.__new__(SamplesGenerator)
     generator.args = SimpleNamespace(
         eval=SimpleNamespace(batch_size=3),
-        rollout=SimpleNamespace(batch_size=1),
+        rollout=SimpleNamespace(batch_size=1, n_samples_per_prompt=1),
     )
     generator.eval_dataloader = _prompt_loader(5)
-    requested_batch_sizes = []
+    dispatches = []
 
-    def fake_generate_batch(dataloader_iter, num_prompts, dynamic_filtering, **_kwargs):
-        requested_batch_sizes.append(num_prompts)
-        prompts, _, _, _, exhausted = samples_generator._collect_prompt_batch(dataloader_iter, num_prompts)
-        return [_sample(prompt) for prompt in prompts], len(prompts), exhausted
+    def fake_dispatch(prompts, labels, images=None, tools=None, **_kwargs):
+        dispatches.append(list(prompts))
+        return [SimpleNamespace(group_id=prompt) for prompt in prompts]
 
-    generator._generate_batch = fake_generate_batch
+    generator._dispatch_to_agent_runners = fake_dispatch
+    generator._process_response_into_experience = lambda response, **_kwargs: (
+        _sample(response.group_id),
+        None,
+    )
+    wait_fetch_local = []
+
+    def fake_wait(handles, num_returns=1, timeout=None, fetch_local=True):
+        wait_fetch_local.append(fetch_local)
+        return [handles[0]], list(handles[1:])
+
+    monkeypatch.setattr(
+        samples_generator.ray,
+        "wait",
+        fake_wait,
+    )
+    monkeypatch.setattr(samples_generator.ray, "get", lambda handle: [handle])
 
     samples = generator.generate_eval_samples()
 
+    assert all(isinstance(sample, EvalExperience) for sample in samples)
     assert [sample.group_ids[0] for sample in samples] == ["p0", "p1", "p2", "p3", "p4"]
-    assert requested_batch_sizes == [3, 3]
+    assert dispatches == [["p0", "p1", "p2"], ["p3"], ["p4"]]
+    assert wait_fetch_local and not any(wait_fetch_local)
+
+
+def test_compact_eval_experience_keeps_metrics_without_training_tensors():
+    sample = SimpleNamespace(
+        sequences=torch.ones(1, 1024),
+        action_log_probs=torch.ones(1, 1023),
+        prompts=["prompt"],
+        group_ids=["group"],
+        rollout_ids=["rollout"],
+        rewards=torch.tensor([0.75]),
+        response_length=torch.tensor([17]),
+        truncated=torch.tensor([False]),
+        info={
+            "policy_version_start": torch.tensor([4]),
+            "vln_ce_success": torch.tensor([1.0]),
+            "non_numeric": "drop me",
+        },
+    )
+
+    compact = _compact_eval_experience(sample)
+
+    assert compact == EvalExperience(
+        prompts=["prompt"],
+        group_ids=["group"],
+        rollout_ids=["rollout"],
+        rewards=[0.75],
+        response_length=[17],
+        truncated=[False],
+        info={"policy_version_start": 4, "vln_ce_success": 1.0},
+    )
+    assert not hasattr(compact, "sequences")
+    assert not hasattr(compact, "action_log_probs")
 
 
 def test_generate_samples_returns_batch_as_rollouts_finish_and_keeps_pool_saturated(monkeypatch):
@@ -271,6 +321,67 @@ def test_process_response_counts_only_action_tokens_for_multiturn_lengths():
         experience.rollout_log_probs,
         torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]]),
     )
+
+
+def test_process_response_drops_raw_images_after_multimodal_preprocessing():
+    generator = object.__new__(SamplesGenerator)
+    generator.tokenizer = None
+    mm_train_inputs = {"pixel_values": torch.ones(2, 3, 4, 4)}
+
+    experience, drop_reason = generator._process_response_into_experience(
+        Trajectory(
+            prompt="p",
+            label="l",
+            images=["raw-image-copy"],
+            observation_text="",
+            observation_tokens=[0, 1, 2],
+            action_ranges=[(1, 3)],
+            rollout_log_probs=[0.0, 0.0, 0.0],
+            reward=1.0,
+            scores=1.0,
+            mm_train_inputs=mm_train_inputs,
+        ),
+        max_len=8,
+    )
+
+    assert drop_reason is None
+    assert experience.images == []
+    assert experience.mm_train_inputs == [mm_train_inputs]
+    assert experience.mm_train_input_specs == []
+
+
+def test_process_response_compacts_vlm_payload_to_lossless_images(monkeypatch):
+    monkeypatch.setenv("MOLT_COMPACT_VLM_EXPERIENCE", "1")
+    generator = object.__new__(SamplesGenerator)
+    generator.tokenizer = SimpleNamespace(image_processor=object())
+    mm_train_inputs = {
+        "pixel_values": torch.arange(24, dtype=torch.float32).reshape(2, 12),
+        "image_grid_thw": torch.tensor([[1, 2, 3], [1, 4, 5]]),
+    }
+    pil_images = [object(), object()]
+
+    experience, drop_reason = generator._process_response_into_experience(
+        Trajectory(
+            prompt="p",
+            label="l",
+            images=["source-ref"],
+            observation_text="",
+            observation_tokens=[0, 1, 2],
+            action_ranges=[(1, 3)],
+            rollout_log_probs=[0.0, 0.0, 0.0],
+            reward=1.0,
+            scores=1.0,
+            mm_train_inputs=mm_train_inputs,
+            pil_images=pil_images,
+        ),
+        max_len=8,
+    )
+
+    assert drop_reason is None
+    assert experience.images == [pil_images]
+    assert experience.mm_train_inputs == []
+    assert len(experience.mm_train_input_specs) == 1
+    assert set(experience.mm_train_input_specs[0]) == set(mm_train_inputs)
 
 
 def test_process_response_rejects_action_ranges_outside_trajectory():

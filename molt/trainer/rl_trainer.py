@@ -14,8 +14,10 @@
 # limitations under the License.
 
 import asyncio
+import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Tuple
 
 import ray
@@ -36,6 +38,7 @@ from molt.trainer.workers.actor_group import RayActorGroup
 from molt.utils.distributed_sampler import DistributedSampler
 from molt.utils.logging_utils import TensorboardLogger, WandbLogger, init_logger
 from molt.utils.utils import get_tokenizer
+from molt.utils.vlm_utils import rebuild_mm_train_inputs
 
 logger = init_logger(__name__)
 
@@ -286,6 +289,45 @@ class BaseRLTrainer:
     def train_step(self, rollout_samples, global_step: int) -> Tuple[Dict, int]:
         # Turn raw rollouts into policy-gradient trajectories with rewards.
         t0 = time.time()
+        mm_reprocess_time = 0.0
+        compact_raw_bytes = 0
+        compact_tensor_bytes = 0
+        compact_samples = [sample for sample in rollout_samples if getattr(sample, "mm_train_input_specs", None)]
+        if compact_samples:
+            requested_workers = int(os.environ.get("MOLT_VLM_REPROCESS_WORKERS", "8"))
+            if requested_workers <= 0:
+                raise ValueError(f"MOLT_VLM_REPROCESS_WORKERS must be positive, got {requested_workers}")
+
+            for sample in compact_samples:
+                if sample.mm_train_inputs:
+                    raise RuntimeError("Compact VLM sample unexpectedly retained mm_train_inputs")
+                if len(sample.images) != 1 or len(sample.mm_train_input_specs) != 1:
+                    raise RuntimeError(
+                        "Compact VLM sample must carry one per-sample image list and one transport spec"
+                    )
+                for image in sample.images[0]:
+                    compact_raw_bytes += int(image.width) * int(image.height) * len(image.getbands())
+                for expected in sample.mm_train_input_specs[0].values():
+                    compact_tensor_bytes += math.prod(expected["shape"]) * expected["values"].element_size()
+
+            def rebuild_one(sample):
+                return rebuild_mm_train_inputs(self.tokenizer, sample.images[0], sample.mm_train_input_specs[0])
+
+            rebuild_t0 = time.time()
+            worker_count = min(requested_workers, len(compact_samples))
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                rebuilt_inputs = list(pool.map(rebuild_one, compact_samples))
+            mm_reprocess_time = time.time() - rebuild_t0
+            for sample, rebuilt in zip(compact_samples, rebuilt_inputs):
+                sample.mm_train_inputs = [rebuilt]
+                sample.images = []
+                sample.mm_train_input_specs = []
+            logger.info(
+                "Rebuilt compact VLM inputs for %s samples in %.2fs with %s workers",
+                len(compact_samples),
+                mm_reprocess_time,
+                worker_count,
+            )
         experiences = self.experience_maker.build_experiences(rollout_samples)
         make_experience_time = time.time() - t0
 
@@ -379,6 +421,11 @@ class BaseRLTrainer:
         # broadcast_transfer (the actual NCCL weight sync). Keep all three so the
         # total stays comparable while the lock-wait is no longer mistaken for transfer.
         status["timing/make_experience"] = make_experience_time
+        status["timing/mm_reprocess"] = mm_reprocess_time
+        if compact_samples:
+            status["rollout/mm_transport_raw_gib"] = compact_raw_bytes / (1024**3)
+            status["rollout/mm_preprocessed_gib"] = compact_tensor_bytes / (1024**3)
+            status["rollout/mm_preprocessed_to_raw_ratio"] = compact_tensor_bytes / max(compact_raw_bytes, 1)
         status["timing/policy_train"] = policy_train_time
         status["timing/broadcast"] = broadcast_time
         status["timing/broadcast_lock_wait"] = self._broadcast_lock_wait_s

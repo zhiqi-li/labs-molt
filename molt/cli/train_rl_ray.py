@@ -52,6 +52,8 @@ def train(args):
             "TORCH_COMPILE_DISABLE",
             "PYTORCH_CUDA_ALLOC_CONF",
             "VLLM_WORKER_MULTIPROC_METHOD",
+            "MOLT_COMPACT_VLM_EXPERIENCE",
+            "MOLT_VLM_REPROCESS_WORKERS",
         ):
             if os.environ.get(name):
                 env_vars[name] = os.environ[name]
