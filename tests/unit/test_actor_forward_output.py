@@ -26,6 +26,17 @@ import torch
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from molt.models.base import _AttrDict, _normalize_output
+from molt.models.base import _dense_hf_forward_autocast_dtype
+
+
+def test_dense_hf_forward_autocast_is_explicit_and_never_enabled_for_moe(monkeypatch):
+    monkeypatch.delenv("MOLT_DENSE_HF_FORWARD_AUTOCAST", raising=False)
+    assert _dense_hf_forward_autocast_dtype(use_hf_model=True, compute_dtype=torch.bfloat16) is None
+
+    monkeypatch.setenv("MOLT_DENSE_HF_FORWARD_AUTOCAST", "1")
+    assert _dense_hf_forward_autocast_dtype(use_hf_model=True, compute_dtype=torch.bfloat16) == torch.bfloat16
+    assert _dense_hf_forward_autocast_dtype(use_hf_model=False, compute_dtype=torch.bfloat16) is None
+    assert _dense_hf_forward_autocast_dtype(use_hf_model=True, compute_dtype=torch.float32) is None
 
 
 def test_hf_causal_lm_output_has_no_logprob_fields():
