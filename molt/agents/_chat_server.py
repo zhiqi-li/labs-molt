@@ -518,6 +518,9 @@ def stitch_session(state: ChatServerState, session_id: str, result):
         traj.reward = result.reward
         traj.scores = result.score if result.score is not None else result.reward
         traj.extra_logs = result.info or {}
+        # Environment-level horizons (for example a VLN action budget) are
+        # independent from a model generation ending with finish_reason=length.
+        traj.truncated = traj.truncated or bool(result.truncated)
         if result.images is not None:
             traj.images = result.images
     return segments

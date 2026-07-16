@@ -403,6 +403,20 @@ def test_stitch_stamps_reward_across_all_segments(monkeypatch):
     assert len(out) == 2 and all(t.reward == 1.0 and t.scores == 0.5 for t in out)
 
 
+def test_stitch_propagates_environment_truncation_to_every_segment(monkeypatch):
+    _patch_prompts(monkeypatch, [[1, 2], [7, 8]])
+    state, _ = _state([_act([90], [-0.1]), _act([91], [-0.2])])
+    state.open("sid", "P", "l", None)
+    session = state.sessions["sid"]
+    asyncio.run(_run_turn(state, session, _MSG))
+    asyncio.run(
+        _run_turn(state, session, {"messages": [{"role": "user", "content": "s"}]})
+    )
+    out = stitch_session(state, "sid", Result(reward=0.0, truncated=True))
+    assert len(out) == 2
+    assert all(trajectory.truncated is True for trajectory in out)
+
+
 def test_stitch_merges_prefix_extending_turns(monkeypatch):
     _patch_prompts(monkeypatch, [[1, 2], [1, 2, 90, 5, 6]])
     state, _ = _state([_act([90], [-0.1]), _act([91, 92], [-0.2, -0.3])])
