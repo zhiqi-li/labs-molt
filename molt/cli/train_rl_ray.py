@@ -100,6 +100,7 @@ def train(args):
             enable_return_routed_experts=args.train.routing_replay,
             pipeline_parallel_size=getattr(args.vllm, "pipeline_parallel_size", 1),
             data_parallel_size=getattr(args.vllm, "data_parallel_size", 1),
+            disable_custom_all_reduce=args.vllm.disable_custom_all_reduce,
         )
 
     # init actor / reference / critic models
@@ -519,6 +520,12 @@ if __name__ == "__main__":
         "TP*PP*DP GPUs; requires --vllm.enable_expert_parallel and the ray executor.",
     )
     parser.add_argument("--vllm.sync_backend", type=str, default="nccl", help="trainer -> vLLM weight sync backend")
+    parser.add_argument(
+        "--vllm.disable_custom_all_reduce",
+        action="store_true",
+        default=False,
+        help="Use the standard distributed backend instead of vLLM custom all-reduce.",
+    )
     parser.add_argument("--vllm.enforce_eager", action="store_true", default=False, help="Disable CUDA graph in vLLM")
     parser.add_argument(
         "--vllm.router_policy",
