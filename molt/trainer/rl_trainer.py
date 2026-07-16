@@ -17,6 +17,7 @@ import asyncio
 import math
 import os
 import time
+from collections import deque
 from typing import Dict, Tuple
 
 import ray
@@ -29,7 +30,7 @@ from molt.datasets import PromptDataset
 from molt.datasets.utils import blending_datasets
 from molt.trainer.algorithm.experience import balance_experiences
 from molt.trainer.algorithm.kl_controller import AdaptiveKLController, FixedKLController
-from molt.trainer.eval_schedule import async_eval_due
+from molt.trainer.eval_schedule import async_eval_due, buffer_until_eval_payload, checkpoint_aligned_eval_due
 from molt.trainer.fsdp import FsdpStrategy
 from molt.trainer.resume_state import resolve_rollout_resume_position
 from molt.trainer.rollout.experience_maker import RemoteExperienceMaker
@@ -1172,13 +1173,18 @@ class TrainingActor(BaseRLTrainer):
         step_start_time = time.time()
         self._latest_client_states = {}
         self._last_checkpoint_client_states = None
+        pending_payloads = deque()
         while True:
             # Time the block — in this async split, the trainer stuck here means the
             # actor side is sitting IDLE waiting for a rollout to be produced (e.g. during
             # a long eval, or if generation becomes the bottleneck). True actor-idle signal.
             _queue_wait_t0 = time.time()
-            payload = self.rollout_queue.get(block=True)
-            actor_idle_wait = time.time() - _queue_wait_t0
+            if pending_payloads:
+                payload = pending_payloads.popleft()
+                actor_idle_wait = 0.0
+            else:
+                payload = self.rollout_queue.get(block=True)
+                actor_idle_wait = time.time() - _queue_wait_t0
             if payload == "done":
                 break
 
@@ -1202,7 +1208,11 @@ class TrainingActor(BaseRLTrainer):
 
             if payload[0] == "eval":
                 _, eval_step, eval_metrics = payload
-                self.rollout_slots.put(global_step, block=True)
+                # Periodic checkpoint barriers publish a dedicated slot for
+                # eval.  Consuming that slot must not mint another token or the
+                # producer can run progressively farther ahead after each eval.
+                if not checkpoint_aligned_eval_due(self.args, eval_step):
+                    self.rollout_slots.put(global_step, block=True)
                 eval_metrics = dict(eval_metrics)
                 current_policy_versions = (
                     ray.get([engine.get_weight_version.remote() for engine in self.vllm_engines])
@@ -1275,6 +1285,21 @@ class TrainingActor(BaseRLTrainer):
             if self.save_logs_and_checkpoints(global_step, status, client_states):
                 self._last_checkpoint_client_states = dict(client_states)
 
+            if checkpoint_aligned_eval_due(self.args, global_step):
+                # Async mode normally releases a pre-update logical step before
+                # training. Publish this exact post-update step as an additional
+                # slot so the generator starts the scheduled eval, then stop the
+                # optimizer while that frozen-policy eval is in flight. Any
+                # already-prefetched train batch stays buffered until the eval
+                # result has been logged and (if best) checkpointed.
+                logger.info("Waiting for checkpoint-aligned evaluation at step %s", global_step)
+                self.rollout_slots.put(global_step, block=True)
+                if not buffer_until_eval_payload(self.rollout_queue, pending_payloads, global_step):
+                    logger.info(
+                        "Skipping inline evaluation at terminal step %s because the rollout producer is exhausted",
+                        global_step,
+                    )
+
         if self.wandb_logger:
             self.wandb_logger.close()
         if self.tensorboard_logger:
@@ -1343,7 +1368,12 @@ class RLTrainer:
         self._eval_only = bool(getattr(strategy.args.eval, "eval_only", False))
 
         self.rollout_queue = Queue(maxsize=queue_size)
-        self.rollout_slots = Queue(maxsize=queue_size)
+        # Slot tokens are flow-control signals, not data.  The rollout payload
+        # queue remains bounded and provides the actual backpressure.  Keeping
+        # slots unbounded prevents an exact-full terminal probe from deadlocking
+        # with the trainer while both actors try to return their final token or
+        # terminal payload.
+        self.rollout_slots = Queue()
         for _ in range(queue_size):
             self.rollout_slots.put(0, block=True)
 
