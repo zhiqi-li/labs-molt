@@ -58,7 +58,6 @@ from molt.utils.vlm_utils import (
     estimate_vllm_input_expansion_delta,
     load_images,
     should_expand_image_placeholder,
-    split_image_placeholder,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,13 +85,65 @@ def _content_to_text_and_images(content) -> tuple[str, list]:
         elif item.get("type") == "image_url":
             ref = item.get("image_url") or {}
             url = ref.get("url") if isinstance(ref, dict) else ref
-            imgs = load_images(url) if url else []
+            if not url:
+                raise ValueError("chat image_url content block is missing its URL")
+            imgs = load_images(url)
+            if not imgs:
+                raise ValueError("chat image_url content block could not be loaded")
             pil.extend(imgs)
             parts.append("<image>" * len(imgs))
     return "".join(parts), pil
 
 
-def _message_for_template(message: dict, content: str) -> dict:
+def _content_to_structured_images(content) -> tuple[Any, list]:
+    """Preserve text/image provenance for structured-content VLM templates.
+
+    Flattening an ``image_url`` block to the literal ``<image>`` and then
+    splitting every such substring loses where the placeholder came from.  In
+    particular, an assistant/tool text that merely *mentions* ``<image>`` would
+    be reinterpreted as another visual input even though it has no matching PIL
+    image.  Qwen3-VL then indexes one row past ``image_grid_thw``.
+
+    Build the structured content directly instead: only successfully loaded
+    ``image_url`` blocks become ``{"type": "image"}``, while literal text is
+    preserved byte-for-byte.  This gives the chat template and the processor
+    the same ordered image cardinality by construction.
+    """
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        return ("" if content is None else str(content)), []
+
+    blocks: list[dict[str, Any]] = []
+    pil_images: list = []
+    for item in content:
+        if not isinstance(item, dict):
+            blocks.append({"type": "text", "text": str(item)})
+            continue
+        if item.get("type") == "text":
+            blocks.append({"type": "text", "text": item.get("text") or ""})
+            continue
+        if item.get("type") != "image_url":
+            # Match _content_to_text_and_images: unsupported block kinds do not
+            # silently become model-visible prompt text.
+            continue
+        ref = item.get("image_url") or {}
+        url = ref.get("url") if isinstance(ref, dict) else ref
+        if not url:
+            raise ValueError("chat image_url content block is missing its URL")
+        loaded = load_images(url)
+        if not loaded:
+            # Dropping a failed image while retaining the rest of the turn can
+            # change which frame each placeholder refers to.  Reject the whole
+            # turn instead of training on shifted image/token pairs.
+            raise ValueError("chat image_url content block could not be loaded")
+        for image in loaded:
+            blocks.append({"type": "image"})
+            pil_images.append(image)
+    return blocks, pil_images
+
+
+def _message_for_template(message: dict, content: Any) -> dict:
     """Preserve structured tool metadata while replacing multimodal content.
 
     OpenAI tool-call arguments are JSON strings, while Hugging Face templates
@@ -120,6 +171,28 @@ def _message_for_template(message: dict, content: str) -> dict:
                     target["arguments"] = {}
         rendered["tool_calls"] = tool_calls
     return rendered
+
+
+def _validate_rendered_image_alignment(processor, prompt_text: str, pil_images: list) -> None:
+    """Fail before processor indexing when rendered placeholders and images differ.
+
+    Qwen-family chat templates emit one ``processor.image_token`` per structured
+    image block before the processor expands it to patch tokens.  The same is
+    true for literal-placeholder processors.  Counting at this boundary catches
+    both template drift and orphan literal placeholders with a useful error,
+    without guessing which image or token should be deleted.
+    """
+    image_token = getattr(processor, "image_token", None)
+    if not isinstance(image_token, str) or not image_token:
+        return
+    placeholder_count = prompt_text.count(image_token)
+    image_count = len(pil_images)
+    if placeholder_count != image_count:
+        raise ValueError(
+            "chat rollout image alignment mismatch before processor: "
+            f"rendered_placeholders={placeholder_count}, loaded_images={image_count}, "
+            f"image_token={image_token!r}"
+        )
 
 
 def _decode_anthropic(body: dict) -> dict:
@@ -283,22 +356,25 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
         return session.last_response
     sp = _build_sampling_params(session.sampling_params or state.default_sampling, body)
 
-    # OpenAI messages -> a ChatML chat with a literal <image> per image + the loaded PIL images, then
-    # the same template + tokenize the RL dataset uses (structured-content split for models whose
-    # image_token isn't the literal <image>). One tokenize; the image count matches pixel_values.
+    # OpenAI messages -> ChatML + loaded PIL images, retaining whether each model-visible image came
+    # from an actual image_url block. Structured-content templates receive explicit image blocks;
+    # literal-placeholder templates receive one <image> per loaded image. One tokenize; the image
+    # count matches the rendered placeholders and pixel_values.
     chat, pil_images = [], []
     for m in messages:
-        text, imgs = _content_to_text_and_images(m.get("content"))
-        chat.append(_message_for_template(m, text))
+        if state.expand_image_placeholder:
+            content, imgs = _content_to_structured_images(m.get("content"))
+        else:
+            content, imgs = _content_to_text_and_images(m.get("content"))
+        chat.append(_message_for_template(m, content))
         pil_images.extend(imgs)
-    if state.expand_image_placeholder:
-        chat = [split_image_placeholder(m) for m in chat]
     # OpenAI-compatible clients can pass model-specific template controls in
     # extra_body without coupling them to the generic runner API.
     kwargs = dict(body.get("chat_template_kwargs") or {})
     if body.get("tools"):
         kwargs["tools"] = body["tools"]
     prompt_text = state.processor.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, **kwargs)
+    _validate_rendered_image_alignment(state.processor, prompt_text, pil_images)
     # process_prompt_with_images (inside _tokenize_observation) runs the VLM image processing
     # (resize/normalize/patchify) — a multi-second CPU op per image. This server drives ALL concurrent
     # rollout sessions on ONE event loop, so tokenizing synchronously would block the loop and stall

@@ -208,18 +208,14 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         if reward is not None:
             previous = grouped[key]["rewards"].get(rollout_id)
             if previous is not None and reward != previous:
-                raise ValueError(
-                    f"Inconsistent rewards for eval rollout {rollout_id!r}: {previous!r} != {reward!r}"
-                )
+                raise ValueError(f"Inconsistent rewards for eval rollout {rollout_id!r}: {previous!r} != {reward!r}")
             grouped[key]["rewards"].setdefault(rollout_id, reward)
         length = _first_scalar(s.response_length)
         if length is not None:
             grouped[key]["lengths"][rollout_id] = grouped[key]["lengths"].get(rollout_id, 0.0) + length
         truncated = _first_scalar(s.truncated)
         if truncated is not None:
-            grouped[key]["truncated"][rollout_id] = max(
-                grouped[key]["truncated"].get(rollout_id, 0.0), truncated
-            )
+            grouped[key]["truncated"][rollout_id] = max(grouped[key]["truncated"].get(rollout_id, 0.0), truncated)
         sample_info = getattr(s, "info", None) or {}
         for metric_name, metric_value in sample_info.items():
             scalar = _first_scalar(metric_value)
@@ -238,8 +234,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
                     by_rollout.setdefault(rollout_id, scalar)
 
     global_info = {
-        metric_name: list(values_by_rollout.values())
-        for metric_name, values_by_rollout in rollout_info.items()
+        metric_name: list(values_by_rollout.values()) for metric_name, values_by_rollout in rollout_info.items()
     }
 
     metrics = {}
@@ -406,6 +401,23 @@ def _experience_batch_size(sample, info) -> int:
     return 1
 
 
+def _backend_error_flag(value, label: str) -> bool:
+    scalar = _first_scalar(value)
+    if isinstance(scalar, bool):
+        return scalar
+    if isinstance(scalar, str):
+        normalized = scalar.strip().lower()
+        if normalized in {"true", "1"}:
+            return True
+        if normalized in {"false", "0", ""}:
+            return False
+    if isinstance(scalar, (int, float)) and not isinstance(scalar, bool):
+        numeric = float(scalar)
+        if math.isfinite(numeric) and numeric in {0.0, 1.0}:
+            return bool(numeric)
+    raise RuntimeError(f"{label} must be a boolean backend-error flag, got {scalar!r}")
+
+
 def validate_force_on_policy_batch(rollout_samples, current_policy_versions) -> int:
     """Prove that every segment came from the single currently loaded policy.
 
@@ -428,6 +440,16 @@ def validate_force_on_policy_batch(rollout_samples, current_policy_versions) -> 
         if any(key not in info for key in ("policy_version_start", "policy_version_end", "policy_frozen")):
             raise RuntimeError(f"force_on_policy segment {index} is missing policy provenance")
         batch_size = _experience_batch_size(sample, info)
+        for key in ("nanobot_backend_error", "esibench_backend_error"):
+            if key not in info:
+                continue
+            backend_rows = _provenance_rows(info[key], batch_size, key)
+            for row, backend_value in enumerate(backend_rows):
+                if _backend_error_flag(backend_value, f"segment {index} row {row} {key}"):
+                    raise RuntimeError(
+                        f"force_on_policy segment {index} row {row} reported {key}; "
+                        "refusing to train on a backend failure"
+                    )
         starts = _provenance_rows(info["policy_version_start"], batch_size, "policy_version_start")
         ends = _provenance_rows(info["policy_version_end"], batch_size, "policy_version_end")
         frozen_rows = _provenance_rows(info["policy_frozen"], batch_size, "policy_frozen")
@@ -580,9 +602,7 @@ class BaseRLTrainer:
         pre_balance_samples = sum(len(exp.sequences) for exp in experiences)
         experiences = balance_experiences(experiences, self.args)
         post_balance_samples = sum(len(exp.sequences) for exp in experiences)
-        rollout_stats["rollout/dp_balance_padding_samples"] = float(
-            post_balance_samples - pre_balance_samples
-        )
+        rollout_stats["rollout/dp_balance_padding_samples"] = float(post_balance_samples - pre_balance_samples)
         # Backward-compatible proof for dashboards/alerts: padding preserves
         # every real segment, so this legacy counter must now stay exactly zero.
         rollout_stats["rollout/dp_balance_dropped_samples"] = 0.0

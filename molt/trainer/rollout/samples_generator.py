@@ -329,17 +329,23 @@ class SamplesGenerator:
         is never reimplemented.
         """
         group_samples: List[Experience] = []
+        force_on_policy = bool(getattr(getattr(self.args, "train", None), "force_on_policy", False))
+        rollout_kind = str(generate_kwargs.get("rollout_kind", "train")).strip().lower()
         for response in ray.get(finished_rollout):
             experience, drop_reason = self._process_response_into_experience(response, **generate_kwargs)
             if experience is not None:
                 group_samples.append(experience)
             elif drop_reason is not None:
                 drop_counts[drop_reason] += 1
+                if force_on_policy and rollout_kind == "train" and drop_reason == "backend_error":
+                    raise RuntimeError(
+                        "force_on_policy training rollout reported a backend error; "
+                        "refusing to skip the affected prompt or train on a synthetic reward"
+                    )
 
         # Training must keep complete sibling groups even when DAPO filtering is
         # disabled. Evaluation retains partial groups so infrastructure failures
         # remain visible to the strict audit instead of being silently hidden.
-        rollout_kind = str(generate_kwargs.get("rollout_kind", "train")).strip().lower()
         require_complete_group = dynamic_filtering or rollout_kind == "train"
         if require_complete_group and group_samples:
             n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)

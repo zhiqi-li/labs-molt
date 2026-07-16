@@ -426,6 +426,26 @@ def test_filter_group_drops_all_training_siblings_after_one_backend_error(monkey
     assert dict(drop_counts) == {"backend_error": 1, "incomplete_group": 3}
 
 
+def test_force_on_policy_filter_group_fails_immediately_on_backend_error(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        train=SimpleNamespace(force_on_policy=True),
+        rollout=SimpleNamespace(n_samples_per_prompt=4),
+    )
+
+    generator._process_response_into_experience = lambda _response, **_kwargs: (None, "backend_error")
+    monkeypatch.setattr(samples_generator.ray, "get", lambda _ref: [object()])
+
+    with pytest.raises(RuntimeError, match="refusing to skip the affected prompt"):
+        generator._filter_group(
+            object(),
+            dynamic_filtering=False,
+            drop_counts=defaultdict(int),
+            rollout_kind="train",
+            n_samples_per_prompt=4,
+        )
+
+
 def test_dispatch_forwards_rollout_and_policy_metadata():
     calls = []
 
