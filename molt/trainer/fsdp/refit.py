@@ -19,9 +19,10 @@ Owns *how* to materialize each pushed parameter (``gather_full_param``): under
 FSDP2, params are ``DTensor`` instances whose ``.full_tensor()`` gathers the
 unsharded tensor across both FSDP shard and TP shard dims in one call.
 
-The sender (``trainer/workers/policy_actor.py``) pushes every ``state_dict``
-entry — vLLM's ``load_weights`` matches by name and ignores what it doesn't have,
-so the "which weights to accept" decision lives on the vLLM side.
+The sender (``trainer/workers/policy_actor.py``) pushes every canonical
+``state_dict`` entry, skipping only aliases proven to share the same tied
+parameter with a present source. vLLM's ``load_weights`` matches the remaining
+entries by name and decides which weights it accepts.
 """
 
 from collections.abc import Mapping
