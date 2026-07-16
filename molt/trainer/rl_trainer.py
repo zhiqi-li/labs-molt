@@ -561,6 +561,7 @@ class GenerateSamplesActor:
         rollout_queue,
         rollout_slots,
         router_url=None,
+        version_source=None,
         **generate_kwargs,
     ):
         # No vllm_engines here: generation runs through the vllm-router via the runner
@@ -577,7 +578,12 @@ class GenerateSamplesActor:
 
         num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
         agent_runners = [
-            AgentRunnerActor.remote(strategy.args.train.agent_path, router_url, model_path=pretrain)
+            AgentRunnerActor.remote(
+                strategy.args.train.agent_path,
+                router_url,
+                model_path=pretrain,
+                version_source=version_source,
+            )
             for _ in range(num_runners)
         ]
         ray.get([r.ready.remote() for r in agent_runners])
@@ -684,6 +690,11 @@ class GenerateSamplesActor:
                         override = getattr(self.args.eval, key)
                         if override is not None:
                             eval_kwargs[key] = override
+                    eval_kwargs.update(
+                        rollout_kind="eval",
+                        policy_version=global_step,
+                        policy_frozen=not self._partial_rollout,
+                    )
                     # Under partial rollout the rollout path (below) deliberately
                     # skips vllm_lock so the trainer's broadcast_to_vllm refit can
                     # interleave via pause/resume. Eval must follow the same
@@ -720,8 +731,15 @@ class GenerateSamplesActor:
                         ray.get(self.vllm_lock.acquire.remote())
                     try:
                         t0 = time.time()
+                        train_kwargs = {
+                            **self.generate_kwargs,
+                            "rollout_kind": "train",
+                            "policy_version": global_step,
+                            # Streaming keeps a refill tail in flight beyond this call.
+                            "policy_frozen": False,
+                        }
                         rollout_samples, rollout_metrics, prompts_consumed, is_exhausted = (
-                            self.samples_generator.generate_samples(**self.generate_kwargs)
+                            self.samples_generator.generate_samples(**train_kwargs)
                         )
                         generation_time = time.time() - t0
                         total_consumed_prompts += prompts_consumed
@@ -919,6 +937,7 @@ class RLTrainer:
             rollout_queue=self.rollout_queue,
             rollout_slots=self.rollout_slots,
             router_url=router_url,
+            version_source=vllm_engines[0] if vllm_engines else None,
             **generate_kwargs,
         )
 

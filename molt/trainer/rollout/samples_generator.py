@@ -427,6 +427,9 @@ class SamplesGenerator:
         )
         truncate_length = generate_kwargs.get("max_len", 2048)
         n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+        rollout_kind = generate_kwargs.get("rollout_kind", "train")
+        policy_version = int(generate_kwargs.get("policy_version", 0))
+        policy_frozen = bool(generate_kwargs.get("policy_frozen", False))
         if images is None:
             images = [None] * len(prompts)
         if tools is None:
@@ -437,7 +440,18 @@ class SamplesGenerator:
             actor = self.agent_runners[self._rr % len(self.agent_runners)]
             self._rr += 1
             refs.append(
-                actor.run_group.remote(prompt, label, img, sampling_params, truncate_length, n_samples, tools=tool)
+                actor.run_group.remote(
+                    prompt,
+                    label,
+                    img,
+                    sampling_params,
+                    truncate_length,
+                    n_samples,
+                    tools=tool,
+                    rollout_kind=rollout_kind,
+                    policy_version=policy_version,
+                    policy_frozen=policy_frozen,
+                )
             )
         return refs
 
