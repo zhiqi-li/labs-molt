@@ -34,7 +34,10 @@ from molt.models import Actor, PolicyLoss, agg_loss
 from molt.models.utils import compute_approx_kl, masked_mean, split_moe_aux_loss
 from molt.trainer.algorithm.experience import Experience, get_model_parallel_size, replay_buffer_drop_last
 from molt.trainer.fsdp import FsdpStrategy
-from molt.trainer.fsdp.refit import gather_full_param
+from molt.trainer.fsdp.refit import (
+    gather_full_param,
+    redundant_tied_weight_aliases,
+)
 from molt.utils import get_tokenizer
 from molt.utils.distributed_util import stateless_init_process_group, torch_dist_barrier_and_cuda_sync
 from molt.utils.logging_utils import init_logger
@@ -628,8 +631,15 @@ class PolicyTrainer:
             pending_tensors.clear()
             pending_bytes = 0
 
-        for name, tensor in model.state_dict().items():
-            # Refit EVERY state_dict entry (each converted to HF names below). vLLM's
+        state_dict = model.state_dict()
+        adapter = getattr(model, "state_dict_adapter", None)
+        tied_aliases = redundant_tied_weight_aliases(model, state_dict) if adapter is None else set()
+        for name, tensor in state_dict.items():
+            # Refit every canonical state_dict entry (each converted to HF names below).
+            # Explicit Transformers tied-weight aliases are skipped when their canonical
+            # source is present: vLLM intentionally ignores those aliases after loading
+            # the shared source (e.g. Qwen3-VL lm_head -> embed_tokens).
+            # vLLM's
             # load_weights matches by name and ignores what it doesn't have, so the
             # "which weights to accept" decision lives on the vLLM side. We deliberately
             # do NOT pre-filter by a named_parameters requires_grad map: its FQNs differ
@@ -641,7 +651,7 @@ class PolicyTrainer:
             # weight and vLLM has no param for it; the HF adapter drops it via
             # `exclude_key_regex` anyway (NeMo-RL relies on that same regex). Skip it
             # here so a tensor-valued `_extra_state` can't trip the expert guard below.
-            if not torch.is_tensor(tensor) or name.endswith("_extra_state"):
+            if not torch.is_tensor(tensor) or name.endswith("_extra_state") or name in tied_aliases:
                 continue
 
             # EP-sharded experts must be DTensors so `gather_full_param`'s
@@ -664,7 +674,6 @@ class PolicyTrainer:
             if not is_rank0:
                 del weight
                 continue
-            adapter = getattr(model, "state_dict_adapter", None)
             if adapter is None:
                 hf_pairs = [(name, weight)]
             elif getattr(adapter, "convert_single_tensor_to_hf", None) is not None:
