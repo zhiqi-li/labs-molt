@@ -26,11 +26,31 @@ from molt.trainer.rollout.router import (
     RouterGenerateClient,
     _align_features_to_canonical,
     _decode_routed_experts,
+    _deterministic_sampling_seed,
     _execute_runner_with_policy_audit,
 )
 
 GEN = "/inference/v1/generate"
 RENDER = "/v1/chat/completions/render"
+
+
+def test_deterministic_sampling_seed_is_stable_and_sibling_specific():
+    common = dict(
+        base_seed=42,
+        rollout_kind="train",
+        policy_version=17,
+        prompt=[{"role": "user", "content": "navigate"}],
+        label={"seed": 9},
+    )
+    first = _deterministic_sampling_seed(**common, sibling_index=0)
+    assert first == _deterministic_sampling_seed(**common, sibling_index=0)
+    assert first != _deterministic_sampling_seed(**common, sibling_index=1)
+    assert first != _deterministic_sampling_seed(**{**common, "policy_version": 18}, sibling_index=0)
+    eval_common = {**common, "rollout_kind": "eval"}
+    assert _deterministic_sampling_seed(**eval_common, sibling_index=0) == _deterministic_sampling_seed(
+        **{**eval_common, "policy_version": 18}, sibling_index=0
+    )
+    assert 0 <= first <= 0xFFFFFFFF
 
 
 class _FakeResp:
