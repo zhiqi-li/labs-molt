@@ -63,7 +63,12 @@ class CheckpointManager:
         if dist.is_initialized():
             dist.barrier()
         self._promote_hf_export(output_dir)
-        if dist.is_initialized():
+        # RayActorGroup waits for every rank's export future, including rank 0's
+        # promotion work.  Its workers must not enter another process-group
+        # collective here: after a terminal checkpoint/eval, that extra barrier
+        # can outlive the export and keep the whole Ray job running indefinitely.
+        # Synchronous callers retain the second barrier by default.
+        if kwargs.get("synchronize_after_promotion", True) and dist.is_initialized():
             dist.barrier()
 
     @staticmethod
