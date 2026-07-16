@@ -102,6 +102,7 @@ class RolloutRayActor:
     """Async vLLM-backed actor that exposes generation utilities."""
 
     async def __init__(self, *args, bundle_indices: list = None, **kwargs):
+        self._weight_version = 0
         backend = kwargs.get("distributed_executor_backend")
         num_gpus = kwargs.pop("num_gpus")
         self._configure_device_env(
@@ -221,7 +222,12 @@ class RolloutRayActor:
             "update_weights_packed",
             args=(metas,),
         )
+        self._weight_version += 1
         return result
+
+    async def get_weight_version(self):
+        """Return the number of successfully completed weight refits."""
+        return self._weight_version
 
     async def reset_weight_update_check(self):
         await self.llm.collective_rpc("reset_weight_update_check")
