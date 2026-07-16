@@ -32,7 +32,7 @@ from tqdm import tqdm
 
 from molt.models import Actor, PolicyLoss, agg_loss
 from molt.models.utils import compute_approx_kl, masked_mean, split_moe_aux_loss
-from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
+from molt.trainer.algorithm.experience import Experience, get_model_parallel_size, replay_buffer_drop_last
 from molt.trainer.fsdp import FsdpStrategy
 from molt.trainer.fsdp.refit import gather_full_param
 from molt.utils import get_tokenizer
@@ -192,9 +192,15 @@ class PolicyTrainer:
                 last_metrics[k] = value
                 continue
             scale = n_tokens if weight == "token" else n_samples
-            reduced_status[k] = (
-                value.float().mean().item() * scale if isinstance(value, torch.Tensor) else value * scale
-            )
+            # A DP-padding-only microbatch has zero real samples. Keep its metric
+            # keys in the collective, but contribute an exact zero rather than
+            # evaluating mean(empty) -> NaN (NaN * 0 is still NaN).
+            if weight == "sample" and n_samples == 0:
+                reduced_status[k] = 0.0
+            else:
+                reduced_status[k] = (
+                    value.float().mean().item() * scale if isinstance(value, torch.Tensor) else value * scale
+                )
 
         reduced_status = self.strategy.all_reduce(reduced_status)
 
@@ -205,7 +211,7 @@ class PolicyTrainer:
         merged_status = {}
         for k, value in reduced_status.items():
             denom = total_tokens if weights[k] == "token" else total_samples
-            merged_status[k] = value / denom
+            merged_status[k] = value / denom if denom else 0.0
 
         merged_status.update(last_metrics)
         merged_status["_num_samples"] = total_samples
@@ -238,7 +244,7 @@ class PolicyTrainer:
             self.replay_buffer,
             batch_size=self.replay_buffer.sample_batch_size,
             shuffle=should_shuffle,
-            drop_last=True,
+            drop_last=replay_buffer_drop_last(self.args),
             pin_memory=self.dataloader_pin_memory,
             collate_fn=self.replay_buffer.collate_fn,
         )
@@ -347,6 +353,10 @@ class PolicyTrainer:
 
         sequences = experience.sequences
         action_mask = experience.action_mask
+        # Real rollout rows always contain at least one action token (the
+        # generator drops zero-action trajectories). DP balancing dummies are
+        # all-false, so this mask also keeps sample-weighted logs honest.
+        real_sample_mask = action_mask.bool().any(dim=-1)
         attention_mask = experience.attention_mask
         old_action_log_probs = experience.action_log_probs
         advantages = experience.advantages
@@ -540,10 +550,17 @@ class PolicyTrainer:
 
         for k, v in experience.info.items():
             if isinstance(v, torch.Tensor):
-                metrics[k] = v
-                weights[k] = "token" if v.dim() == 0 else "sample"
+                if v.dim() == 0:
+                    metrics[k] = v
+                    weights[k] = "token"
+                else:
+                    metrics[k] = v[real_sample_mask] if v.shape[0] == real_sample_mask.shape[0] else v
+                    weights[k] = "sample"
             elif isinstance(v, list):
-                metrics[k] = torch.tensor(v, dtype=torch.float)
+                metric = torch.tensor(v, dtype=torch.float, device=real_sample_mask.device)
+                if metric.shape[0] == real_sample_mask.shape[0]:
+                    metric = metric[real_sample_mask]
+                metrics[k] = metric
                 weights[k] = "sample"
 
         for f in fields(Experience):
@@ -551,13 +568,15 @@ class PolicyTrainer:
                 continue
             value = getattr(experience, f.name)
             if isinstance(value, torch.Tensor) and f.name not in metrics:
-                metrics[f.name] = value
+                metrics[f.name] = (
+                    value[real_sample_mask] if value.shape[0] == real_sample_mask.shape[0] else value
+                )
                 weights[f.name] = "sample"
 
         return {
             "metrics": metrics,
             "weights": weights,
-            "num_samples": float(experience.action_mask.shape[0]),
+            "num_samples": float(real_sample_mask.sum().item()),
             "num_action_tokens": float(action_mask.sum().item()),
         }
 

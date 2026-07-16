@@ -322,7 +322,15 @@ class PolicyLoss(nn.Module):
             if self.is_correction_level == "token":
                 is_filter_ratio = masked_mean(unit_filtered.float(), action_mask, dim=None)
             else:
-                is_filter_ratio = unit_filtered.float().mean()
+                # DP-balance dummies have no action tokens and must not dilute
+                # sequence-level filter diagnostics.
+                sequence_filtered = unit_filtered.float().squeeze(-1)
+                real_sequences = (
+                    torch.ones_like(sequence_filtered, dtype=torch.bool)
+                    if action_mask is None
+                    else action_mask.bool().any(dim=-1)
+                )
+                is_filter_ratio = masked_mean(sequence_filtered, real_sequences, dim=None)
 
             vllm_logprob_diff = torch.nan_to_num(
                 rollout_log_probs.float() - old_log_probs.float(),

@@ -174,12 +174,11 @@ class SamplesGenerator:
     def generate_samples(self, **generate_kwargs) -> Tuple[List[Experience], Dict[str, float], int, bool]:
         """Stream one training-sized batch out of a continuously-refilled rollout pool.
 
-        Keeps `vllm_generate_batch_size` prompt rollouts in flight at all times and
-        returns as soon as `rollout.batch_size` prompt groups have *finished* — it
-        does not wait for the slow tail of the dispatched batch. The unfinished
-        rollouts (and any surplus finished groups) persist on the instance across
-        calls, so vLLM never drains between training steps: generation of the next
-        batch fully overlaps training of the current one.
+        Normally keeps `vllm_generate_batch_size` prompt rollouts in flight and
+        returns as soon as `rollout.batch_size` prompt groups have finished; the
+        slow tail persists across calls for asynchronous overlap. Strict
+        force-on-policy mode instead dispatches at most the groups still needed,
+        so the batch boundary drains with no old-policy tail.
 
         Multi-turn agents emit several step-samples per rollout, so we chunk by
         GROUP (= prompt): each returned batch holds `rollout.batch_size` prompts,
@@ -202,6 +201,7 @@ class SamplesGenerator:
         groups_per_batch = self.args.rollout.batch_size
         inflight_capacity = getattr(self.args.rollout, "vllm_generate_batch_size", None) or groups_per_batch
         dynamic_filtering = self.args.algo.dynamic_filtering_enable
+        force_on_policy = bool(getattr(getattr(self.args, "train", None), "force_on_policy", False))
 
         def finished_group_count() -> int:
             return len({_sample_group_key(sample) for sample in self._finished_samples})
@@ -215,8 +215,13 @@ class SamplesGenerator:
         )
 
         while finished_group_count() < groups_per_batch:
-            # Refill so the runner pool keeps `inflight_capacity` rollouts in flight (engines stay saturated).
+            # Async mode saturates the pool continuously. Strict on-policy mode
+            # never dispatches a group beyond this batch: any slow tail crossing
+            # the subsequent refit would make the next update off-policy.
             free_slots = inflight_capacity - len(self._inflight_rollouts)
+            if force_on_policy:
+                groups_needed = groups_per_batch - finished_group_count() - len(self._inflight_rollouts)
+                free_slots = min(free_slots, groups_needed)
             if free_slots > 0 and self._dataloader_iter is not None:
                 prompts, labels, images, tools, dataloader_exhausted = _collect_prompt_batch(
                     self._dataloader_iter, free_slots
@@ -274,6 +279,11 @@ class SamplesGenerator:
             else:
                 leftover_samples.append(sample)
         self._finished_samples = leftover_samples
+        if force_on_policy:
+            if self._finished_samples:
+                raise RuntimeError("force_on_policy left finished groups beyond the batch boundary")
+            if self._inflight_rollouts:
+                raise RuntimeError("force_on_policy left old-policy rollouts in flight")
 
         # Exhausted only once the dataloader is done AND nothing is buffered or in flight.
         exhausted = self._dataloader_iter is None and not self._finished_samples and not self._inflight_rollouts

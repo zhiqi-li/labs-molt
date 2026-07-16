@@ -14,7 +14,8 @@
 # limitations under the License.
 
 import itertools
-from dataclasses import dataclass, field, fields
+import math
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, List, Union
 
 import torch
@@ -296,13 +297,55 @@ def remove_padding_in_sequences(items: List[Experience]) -> List[Experience]:
     return items
 
 
+def _make_zero_action_dummy(template: Experience) -> Experience:
+    """Shallow-clone one valid sample into a collective-safe padding sample.
+
+    The token/context and multimodal payload stay valid for the model forward,
+    while every optimization/outcome tensor is zeroed.  In particular the
+    all-false action mask makes the dummy contribute neither policy/value
+    gradients nor action tokens.  ``replace`` deliberately keeps large
+    multimodal objects shared rather than copying image tensors for DP padding.
+    """
+    if not isinstance(template.action_mask, torch.Tensor):
+        raise ValueError("DP padding requires an action_mask so dummy gradients can be masked safely")
+
+    preserve = {"sequences", "attention_mask", "routed_experts", "total_length"}
+    updates = {}
+    for f in fields(Experience):
+        value = getattr(template, f.name)
+        if isinstance(value, torch.Tensor) and f.name not in preserve:
+            updates[f.name] = torch.zeros_like(value)
+
+    # Keep the same keys/types so every rank reduces an identical metric dict.
+    # Sample-weighted logging removes zero-action rows before taking means.
+    updates["info"] = {
+        key: torch.zeros_like(value) if isinstance(value, torch.Tensor) else value
+        for key, value in template.info.items()
+    }
+    dummy = replace(template, **updates)
+    if bool(dummy.action_mask.any()):  # defensive: the contract above is safety-critical
+        raise AssertionError("DP padding dummy unexpectedly contains trainable action tokens")
+    return dummy
+
+
+def replay_buffer_drop_last(args) -> bool:
+    """Whether replay DataLoaders may discard a final partial microbatch.
+
+    Strict on-policy static training accumulates the entire balanced shard into
+    one optimizer step, so its final microbatch is part of that policy batch and
+    must never be dropped. Async and dynamic modes retain their old behavior.
+    """
+    train = args.train
+    return not (bool(train.force_on_policy) and not bool(train.dynamic_batch_enable))
+
+
 def balance_experiences(experiences, args):
     """Balance samples across DP ranks by total sequence length, equal-count.
 
     Every DP rank must receive the SAME number of samples: unequal counts yield different
     ``num_steps`` per rank → mismatched collective shapes at the world all_reduces → NCCL
-    hang. So we use equal-size length balancing and drop the trailing remainder so the
-    global sample count divides evenly across ranks.
+    hang. Use equal-size length balancing and pad to the next DP multiple with
+    zero-action dummy Experiences, preserving every real flattened segment.
     """
     items_all = []
     for item in experiences:
@@ -312,21 +355,31 @@ def balance_experiences(experiences, args):
     effective_num = actor_world_size // get_model_parallel_size(args)
     if effective_num <= 0:
         raise ValueError(f"Invalid effective actor count: {effective_num}")
-    if len(items_all) < effective_num:
-        raise ValueError(
-            f"Cannot balance {len(items_all)} samples across {effective_num} effective actor ranks. "
-            "Increase rollout.batch_size/n_samples_per_prompt or drop the final partial batch."
-        )
+    if not items_all:
+        raise ValueError("Cannot balance an empty experience list")
 
-    # Equal counts per rank ⇒ identical num_steps on every rank. Drop the trailing
-    # remainder (< effective_num samples) so the total divides evenly.
+    # Equal counts per rank ⇒ identical num_steps on every rank. Pad rather than
+    # dropping real samples; at most effective_num - 1 dummies are needed.
     remainder = len(items_all) % effective_num
     if remainder:
-        logger.warning(
-            f"[balance_experiences] dropping {remainder} trailing sample(s) so {len(items_all)} "
-            f"divides evenly across {effective_num} DP ranks."
+        padding = effective_num - remainder
+        aux_loss_coef = float(getattr(args.actor, "aux_loss_coef", 0.0) or 0.0)
+        if not math.isfinite(aux_loss_coef) or abs(aux_loss_coef) > 1e-8:
+            raise ValueError(
+                "DP balance padding with zero-action dummies requires a finite actor.aux_loss_coef=0: "
+                "MoE auxiliary loss is not action-masked, so padded samples could change gradients."
+            )
+        shortest = min(
+            items_all,
+            key=lambda item: int(
+                item.total_length.item() if isinstance(item.total_length, torch.Tensor) else item.total_length
+            ),
         )
-        items_all = items_all[:-remainder]
+        logger.warning(
+            f"[balance_experiences] padding {padding} zero-action dummy sample(s) so {len(items_all)} "
+            f"real samples divide evenly across {effective_num} DP ranks."
+        )
+        items_all.extend(_make_zero_action_dummy(shortest) for _ in range(padding))
 
     # Every DP rank enters the same all_reduce over its metric dictionary in
     # PolicyModelActor._record_status, so all partitions must carry the exact

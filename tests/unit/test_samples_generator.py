@@ -119,6 +119,49 @@ def test_generate_samples_returns_batch_as_rollouts_finish_and_keeps_pool_satura
     assert exhausted is False
 
 
+def test_force_on_policy_generation_has_no_slow_tail_at_batch_boundary(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=1, vllm_generate_batch_size=5),
+        algo=SimpleNamespace(dynamic_filtering_enable=False),
+        train=SimpleNamespace(force_on_policy=True),
+    )
+    generator.prompts_dataloader = _prompt_loader(10)
+    _wire_fake_vllm(generator, monkeypatch, _sample)
+
+    first, _, first_dispatched, first_exhausted = generator.generate_samples()
+    assert [sample.group_ids[0] for sample in first] == ["p0", "p1", "p2"]
+    assert first_dispatched == 3
+    assert first_exhausted is False
+    assert generator._inflight_rollouts == []
+    assert generator._finished_samples == []
+
+    second, _, second_dispatched, _ = generator.generate_samples()
+    assert [sample.group_ids[0] for sample in second] == ["p3", "p4", "p5"]
+    assert second_dispatched == 3
+    assert generator._inflight_rollouts == []
+    assert generator._finished_samples == []
+
+
+def test_force_on_policy_generation_drains_final_short_batch(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(batch_size=4, n_samples_per_prompt=1, vllm_generate_batch_size=8),
+        algo=SimpleNamespace(dynamic_filtering_enable=False),
+        train=SimpleNamespace(force_on_policy=True),
+    )
+    generator.prompts_dataloader = _prompt_loader(2)
+    _wire_fake_vllm(generator, monkeypatch, _sample)
+
+    samples, _, prompts_dispatched, exhausted = generator.generate_samples()
+
+    assert [sample.group_ids[0] for sample in samples] == ["p0", "p1"]
+    assert prompts_dispatched == 2
+    assert exhausted is True
+    assert generator._inflight_rollouts == []
+    assert generator._finished_samples == []
+
+
 def test_generate_samples_emits_short_batch_when_dataloader_exhausted(monkeypatch):
     generator = object.__new__(SamplesGenerator)
     generator.args = SimpleNamespace(

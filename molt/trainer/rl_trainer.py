@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import os
 import time
 from typing import Dict, Tuple
@@ -121,9 +122,14 @@ def prepare_datasets(strategy, tokenizer):
     elif args.train.force_on_policy:
         # On-policy: one optimizer step per rollout batch (per epoch), regardless
         # of how many samples multi-turn flatten produces. The generator consumes
-        # rollout.batch_size prompt-groups per round, so the LR scheduler decays
-        # over len(prompts) // rollout.batch_size, not samples // train.batch_size.
-        max_steps = len(prompts_dataset) // args.rollout.batch_size * args.train.num_episodes * args.train.max_epochs
+        # rollout.batch_size prompt-groups per round. The generator emits a final
+        # short batch, so scheduler horizon uses ceil-div (including datasets
+        # smaller than one rollout batch) rather than silently omitting it.
+        rollout_batch_size = int(args.rollout.batch_size)
+        if rollout_batch_size <= 0:
+            raise ValueError(f"rollout.batch_size must be positive, got {rollout_batch_size}")
+        rollout_batches = (len(prompts_dataset) + rollout_batch_size - 1) // rollout_batch_size
+        max_steps = rollout_batches * args.train.num_episodes * args.train.max_epochs
     else:
         max_steps = (
             len(prompts_dataset)
@@ -348,6 +354,104 @@ def eval_is_checkpoint_safe(eval_metrics) -> bool:
     )
 
 
+def validate_force_on_policy_runtime_config(train_args) -> None:
+    """Fail closed unless the sampler/trainer topology is strictly synchronous."""
+    if not bool(getattr(train_args, "force_on_policy", False)):
+        return
+    queue_size = int(getattr(train_args, "async_queue_size", 1))
+    if queue_size != 1:
+        raise ValueError("--train.force_on_policy requires --train.async_queue_size 1")
+    if bool(getattr(train_args, "partial_rollout_enable", False)):
+        raise ValueError("--train.force_on_policy requires --train.partial_rollout_enable disabled")
+
+
+def _exact_nonnegative_version(value, label: str) -> int:
+    scalar = _first_scalar(value)
+    if scalar is None or isinstance(scalar, (bool, str, bytes)):
+        raise RuntimeError(f"{label} must be a finite nonnegative integer, got {scalar!r}")
+    try:
+        numeric = float(scalar)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(f"{label} must be a finite nonnegative integer, got {scalar!r}") from exc
+    if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+        raise RuntimeError(f"{label} must be a finite nonnegative integer, got {scalar!r}")
+    return int(numeric)
+
+
+def _provenance_rows(value, batch_size: int, label: str) -> list:
+    if isinstance(value, torch.Tensor):
+        rows = value.detach().flatten().tolist()
+    elif isinstance(value, (list, tuple)):
+        rows = [_first_scalar(item) for item in value]
+    else:
+        rows = [value]
+    if len(rows) != batch_size:
+        raise RuntimeError(f"{label} has {len(rows)} row(s), expected Experience batch size {batch_size}")
+    return rows
+
+
+def _experience_batch_size(sample, info) -> int:
+    sequences = getattr(sample, "sequences", None)
+    if isinstance(sequences, torch.Tensor) and sequences.dim() > 0:
+        return int(sequences.shape[0])
+    prompts = getattr(sample, "prompts", None)
+    if isinstance(prompts, list) and prompts:
+        return len(prompts)
+    for key in ("policy_version_start", "policy_version_end", "policy_frozen"):
+        value = info.get(key)
+        if isinstance(value, torch.Tensor):
+            return int(value.numel())
+        if isinstance(value, (list, tuple)):
+            return len(value)
+    return 1
+
+
+def validate_force_on_policy_batch(rollout_samples, current_policy_versions) -> int:
+    """Prove that every segment came from the single currently loaded policy.
+
+    The scheduler ``global_step`` is only a logical update counter. vLLM's
+    physical version advances once per packed weight transfer, so provenance
+    must be checked against the engines themselves rather than ``global_step``.
+    """
+    versions = [
+        _exact_nonnegative_version(version, f"vLLM engine {index} version")
+        for index, version in enumerate(current_policy_versions)
+    ]
+    if not versions or len(set(versions)) != 1:
+        raise RuntimeError(f"force_on_policy requires one synchronized vLLM version, got {versions}")
+    expected_version = versions[0]
+    if not rollout_samples:
+        raise RuntimeError("force_on_policy received an empty rollout batch")
+
+    for index, sample in enumerate(rollout_samples):
+        info = getattr(sample, "info", None) or {}
+        if any(key not in info for key in ("policy_version_start", "policy_version_end", "policy_frozen")):
+            raise RuntimeError(f"force_on_policy segment {index} is missing policy provenance")
+        batch_size = _experience_batch_size(sample, info)
+        starts = _provenance_rows(info["policy_version_start"], batch_size, "policy_version_start")
+        ends = _provenance_rows(info["policy_version_end"], batch_size, "policy_version_end")
+        frozen_rows = _provenance_rows(info["policy_frozen"], batch_size, "policy_frozen")
+        for row, (start_value, end_value, frozen_value) in enumerate(zip(starts, ends, frozen_rows)):
+            start = _exact_nonnegative_version(start_value, f"segment {index} row {row} start version")
+            end = _exact_nonnegative_version(end_value, f"segment {index} row {row} end version")
+            if isinstance(frozen_value, bool):
+                frozen = float(frozen_value)
+            elif isinstance(frozen_value, (str, bytes)):
+                frozen = float("nan")
+            else:
+                try:
+                    frozen = float(frozen_value)
+                except (TypeError, ValueError, OverflowError):
+                    frozen = float("nan")
+            if not math.isfinite(frozen) or frozen != 1.0 or start != end or start != expected_version:
+                raise RuntimeError(
+                    "force_on_policy provenance mismatch for segment "
+                    f"{index} row {row}: start={start_value}, end={end_value}, frozen={frozen_value}, "
+                    f"current_vllm_version={expected_version}"
+                )
+    return expected_version
+
+
 class BaseRLTrainer:
     """Training-side base class for non-critic policy RL."""
 
@@ -476,9 +580,12 @@ class BaseRLTrainer:
         pre_balance_samples = sum(len(exp.sequences) for exp in experiences)
         experiences = balance_experiences(experiences, self.args)
         post_balance_samples = sum(len(exp.sequences) for exp in experiences)
-        rollout_stats["rollout/dp_balance_dropped_samples"] = float(
-            pre_balance_samples - post_balance_samples
+        rollout_stats["rollout/dp_balance_padding_samples"] = float(
+            post_balance_samples - pre_balance_samples
         )
+        # Backward-compatible proof for dashboards/alerts: padding preserves
+        # every real segment, so this legacy counter must now stay exactly zero.
+        rollout_stats["rollout/dp_balance_dropped_samples"] = 0.0
 
         # Push experiences to actor shards (and the critic, which trains on the same
         # batch with values + returns) before optimization.
@@ -911,10 +1018,10 @@ class GenerateSamplesActor:
                             **self.generate_kwargs,
                             "rollout_kind": "train",
                             "policy_version": global_step,
-                            # Streaming generation returns before its slow refill tail
-                            # drains, so those in-flight requests can cross the next
-                            # refit even when the outer lock guarded this batch.
-                            "policy_frozen": False,
+                            # Strict on-policy generation drains exactly at the batch
+                            # boundary while this lock prevents a physical refit.
+                            # Async mode retains the streaming slow-tail behavior.
+                            "policy_frozen": bool(self.args.train.force_on_policy),
                         }
                         rollout_samples, rollout_metrics, prompts_consumed, is_exhausted = (
                             self.samples_generator.generate_samples(**train_kwargs)
@@ -1035,11 +1142,22 @@ class TrainingActor(BaseRLTrainer):
             # 1-step-stale rollout that inflates vllm_kl on routing-sensitive MoE
             # checkpoints, at the cost of the generate/train overlap. Default off.
             force_sync = getattr(self.args.train, "force_sync_mode", False)
-            if not force_sync:
+            force_on_policy = bool(self.args.train.force_on_policy)
+            if not force_sync and not force_on_policy:
+                # Async mode keeps its existing overlap: consuming a batch frees
+                # the producer immediately, carrying the pre-update logical step.
                 self.rollout_slots.put(global_step, block=True)
+            if force_on_policy:
+                current_policy_versions = ray.get(
+                    [engine.get_weight_version.remote() for engine in (self.vllm_engines or [])]
+                )
+                validate_force_on_policy_batch(rollout_samples, current_policy_versions)
 
             status, global_step = self.train_step(rollout_samples, global_step)
-            if force_sync:
+            if force_sync or force_on_policy:
+                # train_step returns only after the optimizer step and vLLM
+                # broadcast. Release the sole slot with the updated logical step,
+                # so the next batch starts from the newly loaded weights.
                 self.rollout_slots.put(global_step, block=True)
             status["timing/generation"] = generation_time
             # Async idle accounting (the real "which side is wasted" signal): in the split
@@ -1122,6 +1240,7 @@ class RLTrainer:
             strategy.args.ckpt.save_steps = float("inf")
 
         queue_size = getattr(strategy.args.train, "async_queue_size", 1)
+        validate_force_on_policy_runtime_config(strategy.args.train)
         if queue_size <= 0:
             raise ValueError(f"async_queue_size must be positive, got {queue_size}")
         logger.info(f"async_queue_size={queue_size}")

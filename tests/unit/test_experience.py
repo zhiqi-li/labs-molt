@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from molt.trainer.algorithm.experience import (
@@ -22,13 +23,31 @@ from molt.trainer.algorithm.experience import (
     balance_experiences,
     get_model_parallel_size,
     make_experience_batch,
+    replay_buffer_drop_last,
+    split_experience_batch,
 )
 
 
-def _args(cp=1, tp=1, ep=1, actor_gpus=1):
+def _args(
+    cp=1,
+    tp=1,
+    ep=1,
+    actor_gpus=1,
+    aux_loss_coef=0.0,
+    force_on_policy=False,
+    dynamic_batch_enable=False,
+):
     return SimpleNamespace(
-        actor=SimpleNamespace(num_nodes=1, num_gpus_per_node=actor_gpus),
+        actor=SimpleNamespace(
+            num_nodes=1,
+            num_gpus_per_node=actor_gpus,
+            aux_loss_coef=aux_loss_coef,
+        ),
         fsdp=SimpleNamespace(cp_size=cp, tp_size=tp, ep_size=ep),
+        train=SimpleNamespace(
+            force_on_policy=force_on_policy,
+            dynamic_batch_enable=dynamic_batch_enable,
+        ),
     )
 
 
@@ -50,12 +69,12 @@ def test_balance_experiences_uses_fsdp_data_parallel_size():
 
 
 def test_balance_experiences_equalizes_per_rank_counts():
-    # 10 samples across 4 DP ranks: the 2-sample remainder is dropped so every
-    # rank receives the SAME count. Unequal counts would desync num_steps across
-    # ranks and deadlock the world all_reduce in setup_dynamic_batch.
+    # 10 samples across 4 DP ranks: pad 2 zero-action rows so every rank receives
+    # the SAME count without dropping real samples.
     exp = Experience(
         sequences=torch.arange(20).view(10, 2),
         attention_mask=torch.ones(10, 2, dtype=torch.long),
+        action_mask=torch.ones(10, 1, dtype=torch.bool),
         total_length=torch.arange(10, 0, -1),
     )
 
@@ -63,8 +82,73 @@ def test_balance_experiences_equalizes_per_rank_counts():
 
     assert len(balanced) == 4
     counts = [len(item.sequences) for item in balanced]
-    assert counts == [2, 2, 2, 2]  # equal counts, trailing remainder dropped
-    assert sum(counts) == 8
+    assert counts == [3, 3, 3, 3]
+    assert sum(counts) == 12
+    assert sum(int(item.action_mask.any(dim=-1).sum()) for item in balanced) == 10
+
+
+def test_balance_experiences_pads_213_to_224_without_losing_real_segments():
+    exp = Experience(
+        sequences=torch.arange(426).view(213, 2),
+        attention_mask=torch.ones(213, 2, dtype=torch.long),
+        action_mask=torch.ones(213, 1, dtype=torch.bool),
+        advantages=torch.arange(213, dtype=torch.float).view(213, 1),
+        response_length=torch.ones(213),
+        total_length=torch.arange(213, 0, -1),
+        info={"reward": torch.arange(213, dtype=torch.float)},
+    )
+
+    balanced = balance_experiences([exp], _args(actor_gpus=32))
+
+    assert len(balanced) == 32
+    assert [len(rank.sequences) for rank in balanced] == [7] * 32
+    flattened = [item for rank in balanced for item in split_experience_batch(rank)]
+    real = [item for item in flattened if bool(item.action_mask.any())]
+    padding = [item for item in flattened if not bool(item.action_mask.any())]
+    assert len(real) == 213
+    assert len(padding) == 11
+    assert sorted(int(item.sequences[0]) for item in real) == list(range(0, 426, 2))
+    assert all(not bool(item.action_mask.any()) for item in padding)
+    assert all(float(item.advantages.abs().sum()) == 0.0 for item in padding)
+
+
+@pytest.mark.parametrize("aux_loss_coef", [0.01, -0.01, float("nan"), float("inf")])
+def test_balance_experiences_fails_closed_for_padding_with_moe_aux_loss(aux_loss_coef):
+    exp = Experience(
+        sequences=torch.arange(20).view(10, 2),
+        attention_mask=torch.ones(10, 2, dtype=torch.long),
+        action_mask=torch.ones(10, 1, dtype=torch.bool),
+        total_length=torch.arange(10, 0, -1),
+    )
+
+    with pytest.raises(ValueError, match="aux_loss_coef=0"):
+        balance_experiences([exp], _args(actor_gpus=4, aux_loss_coef=aux_loss_coef))
+
+
+def test_force_on_policy_static_replay_keeps_partial_microbatch_tail():
+    samples = list(range(7))
+    force_static = _args(force_on_policy=True, dynamic_batch_enable=False)
+    async_static = _args(force_on_policy=False, dynamic_batch_enable=False)
+    force_dynamic = _args(force_on_policy=True, dynamic_batch_enable=True)
+
+    force_batches = list(
+        torch.utils.data.DataLoader(
+            samples,
+            batch_size=4,
+            drop_last=replay_buffer_drop_last(force_static),
+        )
+    )
+    async_batches = list(
+        torch.utils.data.DataLoader(
+            samples,
+            batch_size=4,
+            drop_last=replay_buffer_drop_last(async_static),
+        )
+    )
+
+    assert [len(batch) for batch in force_batches] == [4, 3]
+    assert [len(batch) for batch in async_batches] == [4]
+    assert replay_buffer_drop_last(force_dynamic)
 
 
 def test_make_experience_batch_intersects_sparse_info_keys():

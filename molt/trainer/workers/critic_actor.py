@@ -42,7 +42,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from molt.models import Critic, ValueLoss
-from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
+from molt.trainer.algorithm.experience import Experience, get_model_parallel_size, replay_buffer_drop_last
 from molt.trainer.fsdp import FsdpStrategy
 from molt.utils import get_tokenizer
 from molt.utils.distributed_util import torch_dist_barrier_and_cuda_sync
@@ -106,7 +106,7 @@ class CriticTrainer:
             self.replay_buffer,
             batch_size=self.replay_buffer.sample_batch_size,
             shuffle=should_shuffle,
-            drop_last=True,
+            drop_last=replay_buffer_drop_last(self.args),
             pin_memory=self.dataloader_pin_memory,
             collate_fn=self.replay_buffer.collate_fn,
         )
