@@ -31,6 +31,7 @@ from transformers.optimization import get_scheduler
 from molt.models.utils import resolve_ac_mode
 from molt.trainer.fsdp.checkpoint import CheckpointManager
 from molt.trainer.fsdp.optimizer_offload import CpuOptimizerOffloader, local_shard
+from molt.utils.distributed_util import initialize_default_process_group
 from molt.utils.distributed_sampler import DistributedSampler
 
 try:
@@ -171,11 +172,11 @@ class FsdpStrategy:
         if local_rank != -1:
             torch.cuda.set_device(local_rank)
 
-        if not dist.is_initialized():
-            backend = "cuda:nccl,cpu:gloo" if self.cpu_offload else "nccl"
-            dist.init_process_group(backend=backend, timeout=timeout)
-
-        self.world_size = dist.get_world_size()
+        self.world_size = initialize_default_process_group(
+            timeout=timeout,
+            cpu_offload=self.cpu_offload,
+            local_rank=local_rank,
+        )
         if self.world_size == 1 and self.cpu_offload:
             raise NotImplementedError(
                 "CPU offload is not supported by AutoModel/FSDP2 on a single rank; "

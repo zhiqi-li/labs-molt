@@ -17,6 +17,36 @@
 # Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
 
 
+def initialize_default_process_group(*, timeout, cpu_offload, local_rank):
+    """Create and synchronize the default process group before mesh groups.
+
+    NCCL process groups are lazy by default. If the world communicator is
+    first materialized only after a framework has created several subgroups,
+    ranks that progress at different speeds can bootstrap different
+    communicators at the same time. Supplying ``device_id`` asks PyTorch to
+    initialize the world communicator eagerly; the barrier is both a health
+    check and a hard ordering point before any mesh subgroup is created.
+    """
+
+    import torch
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        backend = "cuda:nccl,cpu:gloo" if cpu_offload else "nccl"
+        init_kwargs = {"backend": backend, "timeout": timeout}
+        if local_rank >= 0:
+            init_kwargs["device_id"] = torch.device("cuda", local_rank)
+        dist.init_process_group(**init_kwargs)
+
+    world_size = dist.get_world_size()
+    if world_size > 1:
+        if local_rank >= 0:
+            dist.barrier(device_ids=[local_rank])
+        else:
+            dist.barrier()
+    return world_size
+
+
 def torch_dist_barrier_and_cuda_sync():
     """Synchronize distributed training and CUDA operations.
     This function ensures that:
