@@ -111,6 +111,11 @@ class ChatContext:
     session_id: str  # raw id; rarely needed once base_url carries it
     sampling_params: Any
     max_length: int
+    rollout_kind: str = "train"
+    # Scheduler policy version at dispatch. ``policy_frozen`` states whether
+    # the generation lock guarantees that this version cannot change mid-run.
+    policy_version_start: int = 0
+    policy_frozen: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +229,18 @@ class ChatAgentRunner(Runner):
             logger.info(f"Chat server ready at {self._server_root} (model={_SERVED_MODEL_NAME})")
 
     async def execute(
-        self, prompt, label, sampling_params, max_length, hf_tokenizer, llm_engine, images=None, tools=None
+        self,
+        prompt,
+        label,
+        sampling_params,
+        max_length,
+        hf_tokenizer,
+        llm_engine,
+        images=None,
+        tools=None,
+        rollout_kind: str = "train",
+        policy_version: int = 0,
+        policy_frozen: bool = False,
     ):
         await self._ensure_server(llm_engine, hf_tokenizer, max_length, sampling_params)
         session_id = uuid4().hex
@@ -251,11 +267,19 @@ class ChatAgentRunner(Runner):
             session_id=session_id,
             sampling_params=sampling_params,
             max_length=max_length,
+            rollout_kind=rollout_kind,
+            policy_version_start=int(policy_version),
+            policy_frozen=bool(policy_frozen),
         )
         try:
             result = await self.agent_cls().run(ctx)
             if not isinstance(result, Result):
                 raise TypeError(f"ChatAgent.run must return a Result, got {type(result).__name__}")
+            result.info = dict(result.info or {})
+            result.info["rollout_kind"] = str(rollout_kind)
+            result.info["policy_version_start"] = int(policy_version)
+            result.info["policy_version_end"] = int(policy_version) if policy_frozen else -1
+            result.info["policy_frozen"] = float(bool(policy_frozen))
             return stitch_session(self._state, session_id, result)
         finally:
             self._state.discard(session_id)

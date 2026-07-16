@@ -41,6 +41,7 @@ through the URL path prefix ``/s/<session_id>/v1`` that ``ChatAgentRunner`` buil
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from copy import deepcopy
@@ -89,6 +90,36 @@ def _content_to_text_and_images(content) -> tuple[str, list]:
             pil.extend(imgs)
             parts.append("<image>" * len(imgs))
     return "".join(parts), pil
+
+
+def _message_for_template(message: dict, content: str) -> dict:
+    """Preserve structured tool metadata while replacing multimodal content.
+
+    OpenAI tool-call arguments are JSON strings, while Hugging Face templates
+    (including Qwen3.5) expect a mapping. Normalizing here makes the next turn's
+    rendered assistant tool call token-identical to what the model generated,
+    which preserves both agent context and prefix merging.
+    """
+    rendered = {"role": message.get("role"), "content": content}
+    for key in ("tool_call_id", "name", "reasoning_content", "function_call"):
+        if key in message:
+            rendered[key] = message[key]
+    if message.get("tool_calls"):
+        tool_calls = deepcopy(message["tool_calls"])
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            target = function if isinstance(function, dict) else tool_call
+            arguments = target.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    target["arguments"] = json.loads(arguments)
+                except json.JSONDecodeError:
+                    logger.warning("chat rollout: invalid JSON tool arguments; rendering an empty mapping")
+                    target["arguments"] = {}
+        rendered["tool_calls"] = tool_calls
+    return rendered
 
 
 def _decode_anthropic(body: dict) -> dict:
@@ -258,11 +289,15 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
     chat, pil_images = [], []
     for m in messages:
         text, imgs = _content_to_text_and_images(m.get("content"))
-        chat.append({"role": m.get("role"), "content": text})
+        chat.append(_message_for_template(m, text))
         pil_images.extend(imgs)
     if state.expand_image_placeholder:
         chat = [split_image_placeholder(m) for m in chat]
-    kwargs = {"tools": body["tools"]} if body.get("tools") else {}
+    # OpenAI-compatible clients can pass model-specific template controls in
+    # extra_body without coupling them to the generic runner API.
+    kwargs = dict(body.get("chat_template_kwargs") or {})
+    if body.get("tools"):
+        kwargs["tools"] = body["tools"]
     prompt_text = state.processor.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, **kwargs)
     # process_prompt_with_images (inside _tokenize_observation) runs the VLM image processing
     # (resize/normalize/patchify) — a multi-second CPU op per image. This server drives ALL concurrent
@@ -328,21 +363,43 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
     return action_text, finish_reason
 
 
+def _image_prefix_equal(previous: list, current: list) -> bool:
+    """Whether ``current`` retains every earlier image byte-for-byte in order."""
+    if len(current) < len(previous):
+        return False
+    for old, new in zip(previous, current):
+        if old is new:
+            continue
+        if hasattr(old, "tobytes") and hasattr(new, "tobytes"):
+            equal = (
+                getattr(old, "mode", None) == getattr(new, "mode", None)
+                and getattr(old, "size", None) == getattr(new, "size", None)
+                and old.tobytes() == new.tobytes()
+            )
+        else:
+            equal = old == new
+        if not equal:
+            return False
+    return True
+
+
 def _merge_prefix_steps(steps: list) -> list:
     """Collapse consecutive turns whose prompt prefix-extends the running trajectory back into
     ONE growing trajectory, so each shared token is trained ONCE — O(final_len), not O(turns^2)
     re-forwards of overlapping prefixes (each stateless chat turn re-sends the full history). A
-    prefix break (context compaction) or a turn that adds a new image seals the segment and starts
-    a fresh one. The forward+split tokens are already drift-free, so this changes NOTHING about the
-    trained tokens / logprobs / routing — it only removes redundant re-forwarding."""
+    prefix break (context compaction) or replacement of an earlier image seals the segment and starts
+    a fresh one. Appending new images is safe when every earlier image is byte-identical: the latest
+    step's full multimodal tensors replace the prefix tensors after token merging. The forward+split
+    tokens are already drift-free, so this only removes redundant re-forwarding."""
     segments = [steps[0]]
     for step in steps[1:]:
         cur = segments[-1]
         n = len(cur.observation_tokens)
         astart = step.action_ranges[-1][0]  # this turn's context length (tokens before its action)
         extends = astart >= n and step.observation_tokens[:n] == cur.observation_tokens
-        if not (extends and len(step.pil_images) == len(cur.pil_images)):
-            # New segment: expected on context compaction / a new mid-conversation image, but ALSO
+        images_extend = _image_prefix_equal(cur.pil_images, step.pil_images)
+        if not (extends and images_extend):
+            # New segment: expected on context compaction / replacement of a prior image, but ALSO
             # fires if the tokenizer didn't round-trip (re-template drift) — logged so the resulting
             # O(turns^2) re-forward + lost KV reuse on long episodes isn't silent.
             logger.info("chat rollout: segment split at turn boundary (compaction or re-template drift)")
@@ -351,6 +408,13 @@ def _merge_prefix_steps(steps: list) -> list:
         cur.append_feedback("", "", step.observation_tokens[n:astart])  # new context delta (masked)
         action_lp = step.rollout_log_probs[astart:] if step.rollout_log_probs is not None else None
         cur.append_action(step.observation_tokens[astart:], action_lp, off_policy_len=0)
+        if len(step.pil_images) > len(cur.pil_images):
+            # ``step`` represents the full re-rendered prompt, so its multimodal
+            # tensors already contain old+new images exactly once. Replacing is
+            # correct; concatenating would duplicate the prefix image rows.
+            cur.pil_images = list(step.pil_images)
+            cur.mm_train_inputs = step.mm_train_inputs
+            cur.image_budget = step.image_budget
         if step.routed_experts is not None:  # copy the turn's routing onto the appended [n:] positions
             if cur.routed_experts is None:
                 cur.routed_experts = [None] * len(cur.observation_tokens)

@@ -26,10 +26,11 @@ from molt.agents._chat_server import (
     _chat_completion_body,
     _content_to_text_and_images,
     _decode_anthropic,
+    _merge_prefix_steps,
     _run_turn,
     stitch_session,
 )
-from molt.agents.base import Result
+from molt.agents.base import Result, Trajectory
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +105,70 @@ def test_run_turn_records_exact_tokens(monkeypatch):
     assert traj.action_ranges == [(3, 5)]
     assert traj.rollout_log_probs == [0.0, 0.0, 0.0, -0.3, -0.4]
     assert traj.prompt == "P" and traj.label == "lab"
+
+
+def test_run_turn_forwards_template_kwargs_and_body_tools(monkeypatch):
+    captured = {}
+
+    def apply_chat_template(chat, **kwargs):
+        captured.update(kwargs)
+        return "TEXT"
+
+    _patch_prompts(monkeypatch, [[1, 2]])
+    processor = SimpleNamespace(apply_chat_template=apply_chat_template, image_token="<image>")
+    state = ChatServerState(_FakeTransport([_act([90], [-0.1])]), processor, "policy", 1000, _sampling())
+    state.open("sid", "P", "lab", None)
+    body_tools = [{"type": "function", "function": {"name": "move"}}]
+    body = {
+        "messages": [{"role": "user", "content": "P"}],
+        "tools": body_tools,
+        "chat_template_kwargs": {"enable_thinking": False, "tools": ["must-not-win"]},
+    }
+
+    asyncio.run(_run_turn(state, state.sessions["sid"], body))
+
+    assert captured["enable_thinking"] is False
+    assert captured["tools"] == body_tools
+    assert captured["tokenize"] is False
+    assert captured["add_generation_prompt"] is True
+
+
+def test_run_turn_preserves_structured_tool_messages_for_retemplating(monkeypatch):
+    captured = {}
+
+    def apply_chat_template(chat, **_kwargs):
+        captured["chat"] = chat
+        return "TEXT"
+
+    _patch_prompts(monkeypatch, [[1, 2]])
+    processor = SimpleNamespace(apply_chat_template=apply_chat_template, image_token="<image>")
+    state = ChatServerState(_FakeTransport([_act([90], [-0.1])]), processor, "policy", 1000, _sampling())
+    state.open("sid", "P", "lab", None)
+    body = {
+        "messages": [
+            {"role": "user", "content": "P"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "move", "arguments": '{"action":"LEFT"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "name": "move", "content": "moved"},
+        ]
+    }
+
+    asyncio.run(_run_turn(state, state.sessions["sid"], body))
+
+    assistant = captured["chat"][1]
+    tool = captured["chat"][2]
+    assert assistant["tool_calls"][0]["function"]["arguments"] == {"action": "LEFT"}
+    assert tool["tool_call_id"] == "call-1"
+    assert tool["name"] == "move"
 
 
 def test_run_turn_each_turn_is_its_own_sample(monkeypatch):
@@ -240,6 +305,60 @@ def test_stitch_merges_prefix_extending_turns(monkeypatch):
     assert out[0].observation_tokens == [1, 2, 90, 5, 6, 91, 92]  # each token once
     assert out[0].action_ranges == [(2, 3), (5, 7)]
     assert out[0].rollout_log_probs == [0.0, 0.0, -0.1, 0.0, 0.0, -0.2, -0.3]
+
+
+def _image(value):
+    from PIL import Image
+
+    return Image.new("RGB", (1, 1), (value, value, value))
+
+
+def _multiframe_step(tokens, action_range, images, pixel_rows, logprobs):
+    return Trajectory(
+        prompt="P",
+        label="l",
+        images=None,
+        observation_text="",
+        observation_tokens=list(tokens),
+        mm_train_inputs={"pixel_values": np.arange(pixel_rows).reshape(pixel_rows, 1)},
+        pil_images=list(images),
+        image_budget=pixel_rows,
+        action_ranges=[action_range],
+        off_policy_action_lens=[0],
+        rollout_log_probs=list(logprobs),
+    )
+
+
+def test_prefix_merge_replaces_full_mm_tensors_when_frame_is_appended():
+    first = _multiframe_step([1, 90], (1, 2), [_image(1)], 1, [0.0, -0.1])
+    second = _multiframe_step(
+        [1, 90, 2, 91],
+        (3, 4),
+        [_image(1), _image(2)],
+        2,
+        [0.0, 0.0, 0.0, -0.2],
+    )
+
+    assert _merge_prefix_steps([first, second]) == [first]
+    assert first.observation_tokens == [1, 90, 2, 91]
+    assert first.action_ranges == [(1, 2), (3, 4)]
+    assert first.rollout_log_probs == [0.0, -0.1, 0.0, -0.2]
+    assert len(first.pil_images) == 2
+    assert first.mm_train_inputs["pixel_values"].shape == (2, 1)
+    assert first.image_budget == 2
+
+
+def test_prefix_merge_splits_when_an_existing_frame_changes():
+    first = _multiframe_step([1, 90], (1, 2), [_image(1)], 1, [0.0, -0.1])
+    second = _multiframe_step(
+        [1, 90, 2, 91],
+        (3, 4),
+        [_image(9), _image(2)],
+        2,
+        [0.0, 0.0, 0.0, -0.2],
+    )
+
+    assert _merge_prefix_steps([first, second]) == [first, second]
 
 
 # ---------------------------------------------------------------------------
