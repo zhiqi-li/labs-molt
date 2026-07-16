@@ -389,6 +389,7 @@ families ship today, both on the AutoModel + FSDP2 backend:
 | Qwen3.6-35B-A3B VLM RL on geo3k (multi-turn Python tool) | `quick_start/rl_qwen3_6_35b.sh` | `slurm/rl_qwen3_6_35b.sh` |
 | Qwen3-4B dense SFT on text math | `quick_start/sft_qwen3_4b.sh` | `slurm/sft_qwen3_4b.sh` |
 | Qwen3-4B dense RL on text math | `quick_start/rl_qwen3_4b.sh` | `slurm/rl_qwen3_4b.sh` |
+| Qwen3.5 VLM + Nanobot agentic RL on ESI-Bench | [`quick_start/rl_nanobot_esibench_antihack7.sh`](examples/scripts/quick_start/rl_nanobot_esibench_antihack7.sh) | [OSMO runbook](docs/esibench-nanobot-rl.md) |
 
 Quick-start single-node usage:
 
