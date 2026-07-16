@@ -297,6 +297,7 @@ def create_vllm_engines(
     enable_return_routed_experts: bool = False,
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
+    disable_custom_all_reduce: bool = False,
 ):
     """Spin up a set of vLLM Ray actors on a dedicated placement group.
 
@@ -413,6 +414,9 @@ def create_vllm_engines(
             "num_gpus": num_gpus,
             "worker_num_gpus": worker_num_gpus,
         }
+
+        if disable_custom_all_reduce:
+            actor_kwargs["disable_custom_all_reduce"] = True
 
         if max_images_per_prompt > 0:
             actor_kwargs["limit_mm_per_prompt"] = {"image": max_images_per_prompt}
