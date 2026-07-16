@@ -403,6 +403,32 @@ def test_process_response_counts_only_action_tokens_for_multiturn_lengths():
     )
 
 
+def test_process_response_drops_raw_images_after_multimodal_preprocessing():
+    generator = object.__new__(SamplesGenerator)
+    generator.tokenizer = None
+    mm_train_inputs = {"pixel_values": torch.ones(2, 3, 4, 4)}
+
+    experience, drop_reason = generator._process_response_into_experience(
+        Trajectory(
+            prompt="p",
+            label="l",
+            images=["raw-image-copy"],
+            observation_text="",
+            observation_tokens=[0, 1, 2],
+            action_ranges=[(1, 3)],
+            rollout_log_probs=[0.0, 0.0, 0.0],
+            reward=1.0,
+            scores=1.0,
+            mm_train_inputs=mm_train_inputs,
+        ),
+        max_len=8,
+    )
+
+    assert drop_reason is None
+    assert experience.images == []
+    assert experience.mm_train_inputs == [mm_train_inputs]
+
+
 def test_process_response_keeps_generation_truncation_separate_from_episode_horizon():
     generator = object.__new__(SamplesGenerator)
 

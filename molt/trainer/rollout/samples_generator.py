@@ -728,7 +728,12 @@ class SamplesGenerator:
             routed_experts=routed_experts,
             prompts=[response.prompt],
             labels=[response.label],
-            images=[response.images],
+            # ``mm_train_inputs`` is the canonical multimodal payload consumed by
+            # every actor/reference forward.  Keeping the original PIL/image list
+            # as well duplicates tens of GiB for long embodied rollouts, and the
+            # training stack never reads ``Experience.images`` after preprocessing.
+            # Drop that transport-only copy before the Experience crosses Ray.
+            images=[],
             mm_train_inputs=[response.mm_train_inputs],
             group_ids=[response.group_id] if response.group_id is not None else [],
             rollout_ids=[response.rollout_id] if response.rollout_id is not None else [],
