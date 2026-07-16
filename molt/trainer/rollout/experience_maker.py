@@ -34,7 +34,11 @@ from molt.trainer.algorithm.advantage import (
 )
 from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
 from molt.utils.logging_utils import init_logger
-from molt.utils.seqlen_balancing import get_minimum_num_micro_batch_size, get_seqlen_balanced_partitions
+from molt.utils.seqlen_balancing import (
+    get_forward_balanced_partitions,
+    get_minimum_num_micro_batch_size,
+    get_seqlen_balanced_partitions,
+)
 
 if TYPE_CHECKING:
     from molt.trainer.workers.actor_group import RayActorGroup
@@ -97,7 +101,30 @@ class RemoteExperienceMaker:
                     rollout_samples[i : i + batch_size], self.tokenizer.pad_token_id
                 )
                 samples_list.append(concat_samples)
-        return samples_list
+
+        actor_world_size = self.args.actor.num_nodes * self.args.actor.num_gpus_per_node
+        effective_actor_num = actor_world_size // get_model_parallel_size(self.args)
+        costs = [int(sample.total_length.sum().item()) for sample in samples_list]
+        partitions = get_forward_balanced_partitions(costs, effective_actor_num)
+
+        chunk_size = (len(samples_list) + effective_actor_num - 1) // effective_actor_num
+        before_totals = [
+            sum(costs[rank * chunk_size : min((rank + 1) * chunk_size, len(costs))])
+            for rank in range(effective_actor_num)
+        ]
+        after_totals = [sum(costs[idx] for idx in partition) for partition in partitions]
+        logger.info(
+            "[experience_forward_balance] microbatches=%s actors=%s counts=%s "
+            "tokens_before=%s tokens_after=%s spread_before=%s spread_after=%s",
+            len(samples_list),
+            effective_actor_num,
+            [len(partition) for partition in partitions],
+            before_totals,
+            after_totals,
+            max(before_totals) - min(before_totals),
+            max(after_totals) - min(after_totals),
+        )
+        return [samples_list[idx] for partition in partitions for idx in partition]
 
     @torch.no_grad()
     def build_experiences(self, rollout_samples) -> List[Experience]:
