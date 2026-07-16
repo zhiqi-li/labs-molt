@@ -41,6 +41,7 @@ through the URL path prefix ``/s/<session_id>/v1`` that ``ChatAgentRunner`` buil
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -49,7 +50,7 @@ from uuid import uuid4
 
 import uvicorn
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from molt.agents.base import Trajectory, _extract_generation_logprobs, _tokenize_feedback, _tokenize_observation
 from molt.utils.vlm_utils import (
@@ -144,6 +145,31 @@ def _chat_completion_body(model_name: str, content: str, finish_reason: str) -> 
             }
         ],
     }
+
+
+def _chat_completion_stream(model_name: str, content: str, finish_reason: str):
+    """Encode one captured turn as the OpenAI chat-completions SSE wire.
+
+    The model turn is already complete before this response is encoded, but stock
+    clients such as Pi still require SSE when they send ``stream=true``.  Yielding
+    the whole text in one delta preserves the exact captured token trajectory while
+    satisfying the standard streaming protocol.
+    """
+    completion_id = f"chatcmpl-{uuid4().hex[:24]}"
+    normalized_reason = finish_reason if finish_reason in _OPENAI_FINISH_REASONS else "stop"
+    base = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+    }
+    for delta, reason in (
+        ({"role": "assistant", "content": content}, None),
+        ({}, normalized_reason),
+    ):
+        chunk = {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]}
+        yield f"data: {json.dumps(chunk)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 # Anthropic's Message schema validates stop_reason client-side too; map the raw vLLM
@@ -429,7 +455,7 @@ def mount_session_capture(app, state: ChatServerState) -> None:
     canonical shape and how the reply is encoded back."""
     router = APIRouter()
 
-    async def _serve(session_id, request, decode, encode):
+    async def _serve(session_id, request, decode, encode, stream_encode=None):
         body = decode(await request.json())
         session = state.sessions.get(session_id)
         if session is None:
@@ -438,11 +464,23 @@ def mount_session_capture(app, state: ChatServerState) -> None:
         # otherwise run a second turn concurrently and double-record the sample.
         async with session.lock:
             action_text, finish_reason = await _run_turn(state, session, body)
+        if stream_encode is not None and body.get("stream") is True:
+            return StreamingResponse(
+                stream_encode(state.model_name, action_text, finish_reason),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
         return JSONResponse(encode(state.model_name, action_text, finish_reason))
 
     @router.post("/s/{session_id}/v1/chat/completions")
     async def chat_sess(session_id: str, request: Request):
-        return await _serve(session_id, request, lambda b: b, _chat_completion_body)
+        return await _serve(
+            session_id,
+            request,
+            lambda b: b,
+            _chat_completion_body,
+            _chat_completion_stream,
+        )
 
     @router.post("/s/{session_id}/v1/messages")
     async def messages_sess(session_id: str, request: Request):

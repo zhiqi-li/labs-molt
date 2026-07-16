@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -505,6 +506,30 @@ def test_chat_completion_body_normalizes_finish_reason():
         assert _chat_completion_body("policy", "x", raw)["choices"][0]["finish_reason"] == "stop"
     for raw in ("stop", "length", "tool_calls"):
         assert _chat_completion_body("policy", "x", raw)["choices"][0]["finish_reason"] == raw
+
+
+def test_chat_completion_stream_emits_openai_sse_chunks():
+    events = list(cs._chat_completion_stream("policy", "hello", "length"))
+
+    assert events[-1] == "data: [DONE]\n\n"
+    chunks = [json.loads(event.removeprefix("data: ")) for event in events[:-1]]
+    assert chunks[0]["object"] == "chat.completion.chunk"
+    assert chunks[0]["choices"] == [
+        {
+            "index": 0,
+            "delta": {"role": "assistant", "content": "hello"},
+            "finish_reason": None,
+        }
+    ]
+    assert chunks[1]["choices"] == [{"index": 0, "delta": {}, "finish_reason": "length"}]
+    assert chunks[0]["id"] == chunks[1]["id"]
+
+
+def test_chat_completion_stream_normalizes_unknown_finish_reason():
+    terminal = list(cs._chat_completion_stream("policy", "hello", "abort"))[-2]
+    chunk = json.loads(terminal.removeprefix("data: "))
+
+    assert chunk["choices"][0]["finish_reason"] == "stop"
 
 
 def test_decode_anthropic_normalizes_to_openai_shape():
