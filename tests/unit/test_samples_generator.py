@@ -67,7 +67,7 @@ if "vllm" not in sys.modules:
 
 from molt.agents.base import Trajectory
 from molt.trainer.rollout import samples_generator
-from molt.trainer.rollout.samples_generator import SamplesGenerator
+from molt.trainer.rollout.samples_generator import EvalExperience, SamplesGenerator, _compact_eval_experience
 
 
 def _sample(group_id):
@@ -114,17 +114,57 @@ def test_generate_eval_samples_refills_independent_eval_pool(monkeypatch):
         _sample(response.group_id),
         None,
     )
+    wait_fetch_local = []
+
+    def fake_wait(handles, num_returns=1, timeout=None, fetch_local=True):
+        wait_fetch_local.append(fetch_local)
+        return [handles[0]], list(handles[1:])
+
     monkeypatch.setattr(
         samples_generator.ray,
         "wait",
-        lambda handles, num_returns=1, timeout=None: ([handles[0]], list(handles[1:])),
+        fake_wait,
     )
     monkeypatch.setattr(samples_generator.ray, "get", lambda handle: [handle])
 
     samples = generator.generate_eval_samples()
 
+    assert all(isinstance(sample, EvalExperience) for sample in samples)
     assert [sample.group_ids[0] for sample in samples] == ["p0", "p1", "p2", "p3", "p4"]
     assert dispatches == [["p0", "p1", "p2"], ["p3"], ["p4"]]
+    assert wait_fetch_local and not any(wait_fetch_local)
+
+
+def test_compact_eval_experience_keeps_metrics_without_training_tensors():
+    sample = SimpleNamespace(
+        sequences=torch.ones(1, 1024),
+        action_log_probs=torch.ones(1, 1023),
+        prompts=["prompt"],
+        group_ids=["group"],
+        rollout_ids=["rollout"],
+        rewards=torch.tensor([0.75]),
+        response_length=torch.tensor([17]),
+        truncated=torch.tensor([False]),
+        info={
+            "policy_version_start": torch.tensor([4]),
+            "vln_ce_success": torch.tensor([1.0]),
+            "non_numeric": "drop me",
+        },
+    )
+
+    compact = _compact_eval_experience(sample)
+
+    assert compact == EvalExperience(
+        prompts=["prompt"],
+        group_ids=["group"],
+        rollout_ids=["rollout"],
+        rewards=[0.75],
+        response_length=[17],
+        truncated=[False],
+        info={"policy_version_start": 4, "vln_ce_success": 1.0},
+    )
+    assert not hasattr(compact, "sequences")
+    assert not hasattr(compact, "action_log_probs")
 
 
 def test_generate_samples_returns_batch_as_rollouts_finish_and_keeps_pool_saturated(monkeypatch):

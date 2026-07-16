@@ -18,6 +18,7 @@
 
 import os
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -31,6 +32,64 @@ from molt.trainer.algorithm.experience import Experience
 from molt.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class EvalExperience:
+    """Scalar-only eval record that cannot pin rollout tensors in Ray plasma."""
+
+    prompts: list = field(default_factory=list)
+    group_ids: list = field(default_factory=list)
+    rollout_ids: list = field(default_factory=list)
+    rewards: list = field(default_factory=list)
+    response_length: list = field(default_factory=list)
+    truncated: list = field(default_factory=list)
+    info: dict = field(default_factory=dict)
+
+
+def _eval_scalar(value):
+    """Detach one numeric value from tensor/list storage for eval aggregation."""
+    value = _to_scalar(value)
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (bool, int, float)):
+        return value
+    return None
+
+
+def _compact_eval_experience(sample) -> EvalExperience:
+    """Keep only fields consumed by ``compute_eval_metrics``.
+
+    Multi-turn Experiences retain token, logprob, mask, and VLM tensors. Keeping
+    an entire eval set therefore pins hundreds of GiB of zero-copy Ray objects.
+    Converting the terminal statistics to Python scalars lets the source object
+    be released as soon as each rollout is collected; training Experiences are
+    intentionally untouched.
+    """
+
+    def first_item(name):
+        values = getattr(sample, name, None) or []
+        return [values[0]] if values else []
+
+    def scalar_list(name):
+        value = _eval_scalar(getattr(sample, name, None))
+        return [] if value is None else [value]
+
+    compact_info = {}
+    for name, value in (getattr(sample, "info", None) or {}).items():
+        scalar = _eval_scalar(value)
+        if scalar is not None:
+            compact_info[name] = scalar
+
+    return EvalExperience(
+        prompts=first_item("prompts"),
+        group_ids=first_item("group_ids"),
+        rollout_ids=first_item("rollout_ids"),
+        rewards=scalar_list("rewards"),
+        response_length=scalar_list("response_length"),
+        truncated=scalar_list("truncated"),
+        info=compact_info,
+    )
 
 
 def _collect_prompt_batch(dataloader_iter, num_prompts: int):
@@ -148,12 +207,12 @@ class SamplesGenerator:
             logger.warning(f"warm-resume: load skipped ({e})")
 
     @torch.no_grad()
-    def generate_eval_samples(self, **generate_kwargs) -> List[Experience]:
-        """Generate the entire eval set while continuously refilling a bounded pool."""
+    def generate_eval_samples(self, **generate_kwargs) -> List[EvalExperience]:
+        """Generate the entire eval set into scalar-only records with a bounded pool."""
         if getattr(self, "_eval_dataloader_iter", None) is None:
             self._eval_dataloader_iter = iter(self.eval_dataloader)
 
-        all_experiences: List[Experience] = []
+        all_experiences: List[EvalExperience] = []
         eval_batch_size = getattr(self.args.eval, "batch_size", None) or self.args.rollout.batch_size
         if eval_batch_size <= 0:
             raise ValueError(f"eval.batch_size must be positive, got {eval_batch_size}")
@@ -178,10 +237,16 @@ class SamplesGenerator:
                 if not pending_refs:
                     break
 
-                ready_refs, pending_refs = ray.wait(pending_refs, num_returns=1, timeout=10.0)
+                # Do not prefetch every pending result into this actor's object
+                # store. Fetch exactly the one completed rollout selected below,
+                # compact it to scalars, then release its large Ray tensors.
+                ready_refs, pending_refs = ray.wait(
+                    pending_refs, num_returns=1, timeout=10.0, fetch_local=False
+                )
                 for ref in ready_refs:
                     all_experiences.extend(
-                        self._filter_group(ref, False, drop_counts, **generate_kwargs)
+                        _compact_eval_experience(sample)
+                        for sample in self._filter_group(ref, False, drop_counts, **generate_kwargs)
                     )
                     progress.update(1)
         finally:
