@@ -249,6 +249,11 @@ def train(args):
     # save model
     if not args.ckpt.disable_final_save:
         ray.get(actor_model.async_export_hf_model())
+        strategy.print("Final Hugging Face model export completed")
+
+    # This CLI owns its Ray client connection. Disconnect explicitly so local
+    # launchers can stop the cluster and schedulers can observe a clean exit.
+    ray.shutdown()
 
 
 if __name__ == "__main__":
