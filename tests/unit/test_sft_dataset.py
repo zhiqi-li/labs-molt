@@ -23,9 +23,95 @@ role-specific openers (Kimi), no reply terminator (GLM), alternation-enforced tu
 <end_of_turn> (Gemma), and fullwidth sentinels + eos (DeepSeek).
 """
 
+import json
+
 import pytest
 
 from molt.datasets.sft_dataset import SFTDataset, discover_reply_markers
+
+
+def _tool_dataset():
+    ds = object.__new__(SFTDataset)
+    ds.image_key = None
+    ds.tools_key = "tools"
+    ds.max_images_per_prompt = 4
+    ds.input_key = "messages"
+    ds.output_key = None
+    ds.expand_image_placeholder = False
+    return ds
+
+
+def test_build_row_serializes_tools_and_normalizes_openai_arguments():
+    ds = _tool_dataset()
+    row = {
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+                    }
+                ],
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                },
+            }
+        ],
+    }
+
+    built = ds._build_row(row)
+
+    messages = json.loads(built["conversation"])
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+    assert json.loads(built["tools"]) == row["tools"]
+    assert row["messages"][1]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+
+
+def test_normalize_openai_tool_calls_rejects_non_object_arguments():
+    message = {
+        "role": "assistant",
+        "tool_calls": [{"function": {"name": "f", "arguments": "[1, 2]"}}],
+    }
+    with pytest.raises(ValueError, match="must decode to a JSON object"):
+        SFTDataset._normalize_openai_tool_calls(message)
+
+
+def test_getitem_passes_per_sample_tools_to_chat_template():
+    class _RecordingTokenizer:
+        def __init__(self):
+            self.tools = None
+
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, tools=None):
+            self.tools = tools
+            return "rendered"
+
+    ds = object.__new__(SFTDataset)
+    tools = [{"type": "function", "function": {"name": "weather"}}]
+    ds.rows = [
+        {
+            "conversation": json.dumps([{"role": "assistant", "content": "ok"}]),
+            "images": None,
+            "tools": json.dumps(tools),
+        }
+    ]
+    ds._has_images = False
+    ds.text_tokenizer = _RecordingTokenizer()
+    ds._tokenize = lambda text, images: ([1, 2], None)
+    ds._loss_mask = lambda ids: [1.0, 0.0]
+    ds.max_length = 8
+
+    ds[0]
+
+    assert ds.text_tokenizer.tools == tools
 
 
 class _FakeTok:
