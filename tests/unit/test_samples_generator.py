@@ -373,6 +373,31 @@ def test_training_drops_a_group_that_lost_a_rollout_and_eval_keeps_it(monkeypatc
     assert generator._filter_group(object(), False, defaultdict(int)) == [kept_rollout]  # eval
 
 
+def test_min_group_samples_keeps_a_partial_group_and_filters_its_usable_rollouts(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(n_samples_per_prompt=4, min_group_samples=2),
+        algo=SimpleNamespace(dynamic_filtering_range=(0.0, 1.0)),
+    )
+
+    def rollouts(*scores, failed):
+        usable = [(SimpleNamespace(rollout_ids=[str(i)], scores=torch.tensor([s])), None) for i, s in enumerate(scores)]
+        return usable + [(None, "runner_error")] * failed
+
+    def run(results, dynamic_filtering):
+        monkeypatch.setattr(samples_generator.ray, "get", lambda _: results)
+        drops = defaultdict(int)
+        return generator._filter_group(object(), dynamic_filtering, drops, whole_groups=True), dict(drops)
+
+    mixed = rollouts(1.0, 0.0, failed=2)
+    assert run(mixed, True) == ([sample for sample, _ in mixed[:2]], {"runner_error": 2})  # two siblings suffice
+    assert run(rollouts(1.0, failed=3), True) == ([], {"runner_error": 3, "incomplete_group": 1})
+    # the dynamic filter reads the usable rollouts only: two successes are a uniform group
+    assert run(rollouts(1.0, 1.0, failed=2), True) == ([], {"runner_error": 2, "dynamic_filter": 2})
+    generator.args.rollout.min_group_samples = None  # unset: complete groups only
+    assert run(mixed, True) == ([], {"runner_error": 2, "incomplete_group": 2})
+
+
 def test_process_response_preserves_text_info_through_replay_buffer_append():
     experience, drop_reason = SamplesGenerator._process_response_into_experience(
         Trajectory(

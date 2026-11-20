@@ -869,6 +869,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rollout.n_samples_per_prompt", type=int, default=1, help="number of responses for each prompt in generation"
     )
+    parser.add_argument(
+        "--rollout.min_group_samples",
+        type=int,
+        default=None,
+        help="Train a prompt group once this many of its n_samples_per_prompt rollouts are usable; the dropped ones "
+        "leave the group's baseline (PEAR keeps a group with two verified siblings). Unset: every rollout (complete "
+        "groups only). A batch of partial groups need not divide across the DP ranks; balance_experiences then drops "
+        "its trailing remainder (at most DP-1 samples).",
+    )
     parser.add_argument("--rollout.top_p", type=float, default=1.0)
     parser.add_argument("--rollout.temperature", type=float, default=1.0)
 
@@ -1127,6 +1136,17 @@ if __name__ == "__main__":
         print(f"Recommend setting {args.algo.kl.estimator} to 'k2' or 'k3' when using KL as a loss")
     elif not args.algo.kl.use_loss and args.algo.kl.estimator != "k1":
         print(f"Recommend setting {args.algo.kl.estimator} to 'k1' when not using KL as a loss.")
+
+    min_group_samples = args.rollout.min_group_samples
+    if min_group_samples is not None:
+        # A group-relative baseline or a mixed-reward filter needs two rollouts of the group.
+        group_relative = args.algo.advantage.estimator in ["rloo", "reinforce_baseline", "grpo", "dr_grpo"]
+        lowest = 2 if group_relative or args.algo.dynamic_filtering_enable else 1
+        if not lowest <= min_group_samples <= args.rollout.n_samples_per_prompt:
+            raise ValueError(
+                f"--rollout.min_group_samples must be in [{lowest}, --rollout.n_samples_per_prompt "
+                f"({args.rollout.n_samples_per_prompt})], got {min_group_samples}"
+            )
 
     if args.algo.dynamic_filtering_enable:
         assert args.algo.dynamic_filtering_range[0] < args.algo.dynamic_filtering_range[1], (

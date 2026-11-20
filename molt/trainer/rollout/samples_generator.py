@@ -400,16 +400,18 @@ class SamplesGenerator:
                     score_stats["groups"] += 1.0
                     score_stats["all_pass"] += float(gmean >= max_score)
                     score_stats["all_fail"] += float(gmean <= min_score)
-            # Require COMPLETE groups (training always does, as slime and miles do; eval keeps what
-            # it has): a group that lost a response to a failed rollout or a per-response drop
-            # (vlm_truncation / no_action_tokens / logprob_misalign / ...) has < n_samples
-            # usable samples, which would pull the accepted count off train_batch_size and make
-            # it indivisible by the DP-rank count -> per-sample forward microbatches split unevenly
-            # -> NCCL collective desync/hang. Drop+backfill the whole group so each accepted group
-            # contributes exactly n_samples (batch stays a clean groups_per_batch * n_samples).
+            # Training needs the group's rollouts for its baseline (eval keeps what it has): by default
+            # every one of them (COMPLETE groups, as slime and miles do), or --rollout.min_group_samples
+            # of them (PEAR keeps a group with two verified siblings; the dropped ones leave its
+            # baseline). A group short of that lost rollouts to failed rollouts or per-response drops
+            # (vlm_truncation / no_action_tokens / logprob_misalign / ...): drop and backfill it.
+            # Complete groups keep the batch a clean groups_per_batch * n_samples, divisible by the
+            # DP ranks; partial groups need not, and balance_experiences then drops the trailing
+            # remainder (at most DP-1 samples), since an uneven per-rank forward count desyncs NCCL.
             n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
+            required = min(getattr(self.args.rollout, "min_group_samples", None) or n_samples, n_samples)
             n_rollouts = len(rollout_samples)
-            if n_rollouts < n_samples:
+            if n_rollouts < required:
                 drop_counts["incomplete_group"] += len(group_samples)
                 return []
             if dynamic_filtering and not self._passes_dynamic_filter(rollout_samples):
