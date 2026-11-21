@@ -26,8 +26,9 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
         hf = tmp_path / "_hf/global_step11"
         hf.mkdir(parents=True)
         (hf / "model.safetensors.index.json").write_text("{}")
-        torch.save({"global_step": 11, "episode": 0, "total_consumed_prompts": start_cursor,
-                    "data_loader_state_dict": source_loader.state_dict()}, anchor / "extra_state.pt")
+        state = {"global_step": 11, "episode": 0, "total_consumed_prompts": start_cursor,
+                 "data_loader_state_dict": source_loader.state_dict()}
+        torch.save({"client_state": state}, anchor / "extra_state.pt")
         _, resume = rl_trainer._load_bootstrap_resume_source(str(anchor))
     monkeypatch.setattr(rl_trainer.ray, "get", lambda value: value)
     monkeypatch.setattr(rl_trainer.ray, "put", lambda value: value)

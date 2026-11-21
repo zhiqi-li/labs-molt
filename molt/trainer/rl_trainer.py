@@ -53,7 +53,7 @@ def _checkpoint_state_digest(path: Path) -> str:
 def _load_bootstrap_resume_source(path: str):
     actor_checkpoint = Path(path).resolve(strict=True)
     state_path = actor_checkpoint / "extra_state.pt"
-    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    state = torch.load(state_path, map_location="cpu", weights_only=False)["client_state"]
     step = state["global_step"]
     if type(step) is not int or step < 1 or actor_checkpoint.name != f"global_step{step}":
         raise ValueError("Bootstrap source must name a published global_stepN checkpoint")
