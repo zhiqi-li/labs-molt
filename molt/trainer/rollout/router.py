@@ -31,8 +31,10 @@ trainer round-robins prompts across a list of them (``--rollout.num_runners``).
 import asyncio
 import base64
 import io
+import os
 import socket
 import time
+from collections import OrderedDict
 from copy import deepcopy
 from types import SimpleNamespace
 from uuid import uuid4
@@ -214,6 +216,17 @@ def _align_features_to_canonical(features: dict, canonical: list, image_token_id
     ph["image"] = runs
 
 
+def _image_items(features: dict, count: int):
+    """(kwargs_data items, mm_hashes items) of an image-only render of ``count`` images, else None."""
+    keys = {"mm_placeholders", "kwargs_data", "mm_hashes"}
+    if set(features) != keys or any(not isinstance(features[k], dict) or set(features[k]) != {"image"} for k in keys):
+        return None
+    kwargs, hashes = features["kwargs_data"]["image"], features["mm_hashes"]["image"]
+    if not isinstance(kwargs, list) or not isinstance(hashes, list) or len(kwargs) != count or len(hashes) != count:
+        return None
+    return list(kwargs), list(hashes)
+
+
 class RouterGenerateClient:
     """The unified rollout transport over the router.
 
@@ -227,10 +240,19 @@ class RouterGenerateClient:
     the OpenAI ``/v1/*`` routes, whose token_ids the router schema-strips). It also carries the shared
     aiohttp session (``.http``)."""
 
+    # MOLT_RENDER_CACHE=1: per-session render cache. A rollout's image list only grows (the chat server passes the
+    # same PIL objects every turn), and render's per-image kwargs_data / mm_hashes depend on that image alone (the
+    # image processor's per-image budget is independent of the image count below ~512 images; checked bitwise on
+    # the M2 processor), so a turn renders only its new images and reuses the earlier items. mm_placeholders are
+    # rebuilt by _align_features_to_canonical anyway. Off by default; the engine-side mm cache stays off.
+    RENDER_CACHE_SESSIONS = 64
+
     def __init__(self, http_client, *, model_name="policy", image_token_id=None):
         self.http = http_client
         self.model_name = model_name
         self.image_token_id = image_token_id  # HF processor's image placeholder id (VLM realign)
+        self._render_cache_on = os.environ.get("MOLT_RENDER_CACHE") == "1"
+        self._render_cache = OrderedDict()  # session id -> (images, kwargs_data items, mm_hashes items), LRU
 
     async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None, session_id=None):
         prompt = list(prompt_token_ids)
@@ -241,10 +263,7 @@ class RouterGenerateClient:
         sid = session_id or uuid4().hex
         features = None
         if multi_modal_data and multi_modal_data.get("image"):
-            rendered = await self._render(multi_modal_data["image"], sid)
-            features = rendered.get("features")
-            if features is None:
-                raise RuntimeError("/v1/chat/completions/render returned no features for an image prompt.")
+            features = await self._render_features(multi_modal_data["image"], sid)
             _align_features_to_canonical(features, prompt, self.image_token_id)
         return await self._generate_inference(prompt, sampling_params, features, sid)
 
@@ -268,6 +287,46 @@ class RouterGenerateClient:
                 if fatal or attempt == 19:
                     raise
             await asyncio.sleep(1)
+
+    async def _render_features(self, images, session_id):
+        """Render's ``features`` for ``images``; with the session cache, only the images past the cached prefix."""
+        async def render(batch):
+            features = (await self._render(batch, session_id)).get("features")
+            if features is None:
+                raise RuntimeError("/v1/chat/completions/render returned no features for an image prompt.")
+            return features
+
+        if not self._render_cache_on:
+            return await render(images)
+        images = list(images)
+        cached = self._render_cache.pop(session_id, None)
+        k = 0
+        if cached is not None:
+            old, _, _ = cached
+            while k < min(len(old), len(images)) and images[k] is old[k]:
+                k += 1
+            if k < len(old):  # not an extension of the cached list: render everything again
+                k = 0
+        if k and k == len(images):
+            kwargs, hashes = cached[1], cached[2]
+        else:
+            new = await render(images[k:])
+            items = _image_items(new, len(images) - k)
+            if items is None:  # a features shape this cache does not know: no caching for this session
+                return new if k == 0 else await render(images)
+            kwargs = (cached[1][:k] if k else []) + items[0]
+            hashes = (cached[2][:k] if k else []) + items[1]
+            if k == 0:
+                self._remember(session_id, images, kwargs, hashes)
+                return new
+        self._remember(session_id, images, kwargs, hashes)
+        return {"mm_placeholders": {"image": [{"offset": 0, "length": 0} for _ in images]},
+                "kwargs_data": {"image": list(kwargs)}, "mm_hashes": {"image": list(hashes)}}
+
+    def _remember(self, session_id, images, kwargs, hashes):
+        self._render_cache[session_id] = (images, list(kwargs), list(hashes))
+        while len(self._render_cache) > self.RENDER_CACHE_SESSIONS:
+            self._render_cache.popitem(last=False)
 
     async def _render(self, images, session_id):
         """POST the image(s) to the stock ``/v1/chat/completions/render`` route (server-side chat
