@@ -685,7 +685,11 @@ class GenerateSamplesActor:
                 "agent": self.args.train.agent_path,
                 "seed": self.args.train.seed,
                 "data": data,
-                "rollout": {k: v for k, v in vars(self.args.rollout).items() if k != "num_runners"},
+                "rollout": {
+                    k: v
+                    for k, v in vars(self.args.rollout).items()
+                    if k not in {"num_runners", "vllm_generate_batch_size"}
+                },
                 "vllm": {k: v for k, v in vars(self.args.vllm).items() if k not in {"num_engines", "router_policy"}},
                 "reward": vars(self.args.reward),
                 "filter": (self.args.algo.dynamic_filtering_enable, self.args.algo.dynamic_filtering_range),
@@ -770,7 +774,8 @@ class GenerateSamplesActor:
 
                 if bootstrap_input:
                     saved = torch.load(bootstrap_input, map_location="cpu", weights_only=False, mmap=True)
-                    # Older bundles recorded the router policy even though it only selects a serving engine.
+                    # These serving settings can change when consuming an older pre-generated batch.
+                    saved["recipe"]["rollout"].pop("vllm_generate_batch_size", None)
                     saved["recipe"]["vllm"].pop("router_policy", None)
                     if saved["recipe"] != bootstrap_recipe:
                         raise ValueError(f"Rollout bootstrap recipe differs from this run: {bootstrap_input}")

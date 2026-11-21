@@ -33,7 +33,11 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
                 agent_path="same-agent",
             ),
             data=SimpleNamespace(prompt_dataset=str(dataset_path)),
-            rollout=SimpleNamespace(batch_size=2, num_runners=2 if produce else 4),
+            rollout=SimpleNamespace(
+                batch_size=2,
+                num_runners=2 if produce else 4,
+                vllm_generate_batch_size=2 if produce else 3,
+            ),
             vllm=SimpleNamespace(
                 num_engines=4 if produce else 8, router_policy="cache_aware" if produce else "consistent_hash"
             ),
@@ -44,10 +48,10 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
         generator.generate_kwargs = {"temperature": 1.0}
         generator.prompts_dataloader = StatefulDataLoader(range(4), batch_size=None)
         generator.eval_dataloader = None
-        generator._partial_rollout = False
+        generator._partial_rollout = not produce
         generator.vllm_lock = SimpleNamespace(
-            acquire=SimpleNamespace(remote=lambda: None),
-            release=SimpleNamespace(remote=lambda: None),
+            acquire=SimpleNamespace(remote=Mock()),
+            release=SimpleNamespace(remote=Mock()),
         )
         payloads = []
         generator.rollout_queue = SimpleNamespace(put=lambda item, *, block: payloads.append(item))
@@ -67,12 +71,17 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
         )
         generator.fit(0, 0)
         sample.assert_called_once()
+        if not produce:
+            generator.vllm_lock.acquire.remote.assert_not_called()
+            generator.vllm_lock.release.remote.assert_not_called()
         return payloads
 
     assert run("producer", produce=True) == []
     saved = torch.load(bootstrap, weights_only=False, map_location="cpu")
     assert "router_policy" not in saved["recipe"]["vllm"]
+    assert "vllm_generate_batch_size" not in saved["recipe"]["rollout"]
     saved["recipe"]["vllm"]["router_policy"] = "cache_aware"  # bundle from before routing was excluded
+    saved["recipe"]["rollout"]["vllm_generate_batch_size"] = 2
     torch.save(saved, bootstrap)
     first, second, done = run("consumer")
     assert [s.reload().sequences.item() for s in first[0]] == [0, 1]

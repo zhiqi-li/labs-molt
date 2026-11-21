@@ -1129,8 +1129,10 @@ if __name__ == "__main__":
     if bootstrap_input or bootstrap_output:
         if bootstrap_input and bootstrap_output:
             raise ValueError("Choose one of --train.rollout_bootstrap_input and --train.rollout_bootstrap_output")
-        if args.eval.eval_only or args.train.rollout_replay_dir or args.train.partial_rollout_enable:
-            raise ValueError("Rollout bootstrap requires a training dataset and a drained rollout batch")
+        if args.eval.eval_only or args.train.rollout_replay_dir:
+            raise ValueError("Rollout bootstrap requires a training dataset and live sampling")
+        if bootstrap_output and args.train.partial_rollout_enable:
+            raise ValueError("Rollout bootstrap output requires a drained rollout batch")
         if bootstrap_output and (args.ckpt.load_enable or args.eval.eval_at_start):
             raise ValueError("Rollout bootstrap output requires a fresh run without baseline eval")
 
