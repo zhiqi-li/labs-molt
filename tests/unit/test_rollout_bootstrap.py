@@ -12,8 +12,23 @@ from molt.trainer import rl_trainer
 from molt.trainer.algorithm.experience import Experience
 
 
-def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypatch):
+@pytest.mark.parametrize("start_cursor", [0, 2])
+def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypatch, start_cursor):
     bootstrap = str(tmp_path / "first-rollout.pt")
+    resume = None
+    source_loader = StatefulDataLoader(range(start_cursor + 4), batch_size=None)
+    if start_cursor:
+        source_iter = iter(source_loader)
+        for _ in range(start_cursor):
+            next(source_iter)
+        anchor = tmp_path / "_actor/global_step11"
+        anchor.mkdir(parents=True)
+        hf = tmp_path / "_hf/global_step11"
+        hf.mkdir(parents=True)
+        (hf / "model.safetensors.index.json").write_text("{}")
+        torch.save({"global_step": 11, "episode": 0, "total_consumed_prompts": start_cursor,
+                    "data_loader_state_dict": source_loader.state_dict()}, anchor / "extra_state.pt")
+        _, resume = rl_trainer._load_bootstrap_resume_source(str(anchor))
     monkeypatch.setattr(rl_trainer.ray, "get", lambda value: value)
     monkeypatch.setattr(rl_trainer.ray, "put", lambda value: value)
 
@@ -46,7 +61,9 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
             eval=SimpleNamespace(steps=float("inf")),
         )
         generator.generate_kwargs = {"temperature": 1.0}
-        generator.prompts_dataloader = StatefulDataLoader(range(4), batch_size=None)
+        generator.prompts_dataloader = StatefulDataLoader(range(start_cursor + 4), batch_size=None)
+        if resume:
+            generator.prompts_dataloader.load_state_dict(source_loader.state_dict())
         generator.eval_dataloader = None
         generator._partial_rollout = not produce
         generator.vllm_lock = SimpleNamespace(
@@ -69,7 +86,7 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
         generator.samples_generator = SimpleNamespace(
             generate_samples=sample, prompts_drained=not produce, state_dict=dict
         )
-        generator.fit(0, 0)
+        generator.fit(0, start_cursor, resume)
         sample.assert_called_once()
         if not produce:
             generator.vllm_lock.acquire.remote.assert_not_called()
@@ -79,14 +96,16 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
     assert run("producer", produce=True) == []
     saved = torch.load(bootstrap, weights_only=False, map_location="cpu")
     assert "router_policy" not in saved["recipe"]["vllm"]
+    if resume:
+        assert saved["recipe"]["resume"] == resume
     assert "vllm_generate_batch_size" not in saved["recipe"]["rollout"]
     saved["recipe"]["vllm"]["router_policy"] = "cache_aware"  # bundle from before routing was excluded
     saved["recipe"]["rollout"]["vllm_generate_batch_size"] = 2
     torch.save(saved, bootstrap)
     first, second, done = run("consumer")
-    assert [s.reload().sequences.item() for s in first[0]] == [0, 1]
-    assert first[1]["total_consumed_prompts"] == 2 and first[2] == {"count": 2}
-    assert [s.sequences.item() for s in second[0]] == [2, 3]
-    assert second[1]["total_consumed_prompts"] == 4 and done == "done"
+    assert [s.reload().sequences.item() for s in first[0]] == [start_cursor, start_cursor + 1]
+    assert first[1]["total_consumed_prompts"] == start_cursor + 2 and first[2] == {"count": 2}
+    assert [s.sequences.item() for s in second[0]] == [start_cursor + 2, start_cursor + 3]
+    assert second[1]["total_consumed_prompts"] == start_cursor + 4 and done == "done"
     with pytest.raises(ValueError, match="Rollout bootstrap recipe differs"):
         run("wrong-seed", seed=43)

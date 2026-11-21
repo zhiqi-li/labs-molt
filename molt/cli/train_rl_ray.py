@@ -974,7 +974,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--train.rollout_bootstrap_input",
-        help="On a fresh run, train on the first batch from this trusted file and continue sampling at its prompt cursor.",
+        help="Train on the first batch from this trusted file and continue sampling at its prompt cursor.",
+    )
+    parser.add_argument(
+        "--train.rollout_bootstrap_resume_from",
+        help="Published _actor/global_stepN directory binding bootstrap to the restored checkpoint and prompt cursor.",
     )
     parser.add_argument(
         "--train.check_weight_update_equal",
@@ -1126,6 +1130,11 @@ if __name__ == "__main__":
 
     bootstrap_input = args.train.rollout_bootstrap_input
     bootstrap_output = args.train.rollout_bootstrap_output
+    bootstrap_resume = args.train.rollout_bootstrap_resume_from
+    if bootstrap_resume and not (bootstrap_output or (bootstrap_input and args.ckpt.load_enable)):
+        raise ValueError("A bootstrap resume source requires output or input with checkpoint restore")
+    if bootstrap_input and args.ckpt.load_enable and not bootstrap_resume:
+        raise ValueError("Checkpoint restore with bootstrap input requires its source checkpoint")
     if bootstrap_input or bootstrap_output:
         if bootstrap_input and bootstrap_output:
             raise ValueError("Choose one of --train.rollout_bootstrap_input and --train.rollout_bootstrap_output")

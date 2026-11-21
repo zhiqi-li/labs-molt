@@ -45,6 +45,27 @@ from molt.utils.utils import get_tokenizer
 logger = init_logger(__name__)
 
 
+def _checkpoint_state_digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _load_bootstrap_resume_source(path: str):
+    actor_checkpoint = Path(path).resolve(strict=True)
+    state_path = actor_checkpoint / "extra_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    step = state["global_step"]
+    if type(step) is not int or step < 1 or actor_checkpoint.name != f"global_step{step}":
+        raise ValueError("Bootstrap source must name a published global_stepN checkpoint")
+    if actor_checkpoint.parent.name != "_actor" or state["total_consumed_prompts"] <= 0:
+        raise ValueError("Bootstrap source must contain a restored prompt cursor")
+    model = actor_checkpoint.parent.parent / "_hf" / actor_checkpoint.name
+    if not (model / "model.safetensors.index.json").is_file():
+        raise ValueError(f"Missing published HF export for bootstrap source: {model}")
+    recipe = {"model": str(model), "step": step, "state_sha256": _checkpoint_state_digest(state_path)}
+    return state, recipe
+
+
 def prepare_datasets(strategy, tokenizer):
     args = strategy.args
 
@@ -667,7 +688,7 @@ class GenerateSamplesActor:
         self.prompts_dataloader.load_state_dict(state_dict)
         self.samples_generator.load_state_dict(rollout_generator_state_dict)
 
-    def fit(self, episode: int, total_consumed_prompts: int) -> None:
+    def fit(self, episode: int, total_consumed_prompts: int, bootstrap_resume: dict | None = None) -> None:
         eval_steps = self.args.eval.steps
         # eval_at_start must fire only on a genuinely FRESH run. The
         # GenerateSamplesActor transiently reads global_step 0 at startup even on
@@ -676,7 +697,7 @@ class GenerateSamplesActor:
         # consumed-prompt counter is 0 only on a fresh start (>0 once a checkpoint
         # is loaded), so it's the reliable fresh-run signal.
         fresh_start = total_consumed_prompts == 0
-        bootstrap_input = getattr(self.args.train, "rollout_bootstrap_input", None) if fresh_start else None
+        bootstrap_input = getattr(self.args.train, "rollout_bootstrap_input", None) if fresh_start or bootstrap_resume else None
         bootstrap_output = getattr(self.args.train, "rollout_bootstrap_output", None)
         if bootstrap_input or bootstrap_output:
             data = vars(self.args.data).copy()
@@ -695,6 +716,9 @@ class GenerateSamplesActor:
                 "filter": (self.args.algo.dynamic_filtering_enable, self.args.algo.dynamic_filtering_range),
                 "sampling": self.generate_kwargs,
             }
+            if bootstrap_resume:
+                bootstrap_recipe["model"] = bootstrap_resume["model"]
+                bootstrap_recipe["resume"] = bootstrap_resume
             # Launchers can stage identical inputs in distinct run directories.
             for section, key in ((data, "prompt_dataset"), (bootstrap_recipe, "agent")):
                 path = section[key]
@@ -781,9 +805,12 @@ class GenerateSamplesActor:
                         raise ValueError(f"Rollout bootstrap recipe differs from this run: {bootstrap_input}")
                     samples = saved["samples"]
                     client_states = saved["client_states"]
+                    next_cursor = client_states["total_consumed_prompts"]
+                    if bootstrap_resume and (client_states["episode"] != ep or next_cursor <= total_consumed_prompts):
+                        raise ValueError("Bootstrap cursor must advance its source checkpoint within the same episode")
                     self.prompts_dataloader.load_state_dict(client_states["data_loader_state_dict"])
-                    total_consumed_prompts = client_states["total_consumed_prompts"]
-                    pbar.update(total_consumed_prompts)
+                    pbar.update(next_cursor - total_consumed_prompts)
+                    total_consumed_prompts = next_cursor
                     for sample in samples:
                         sample.offload()
                     logger.info(f"[rollout_bootstrap] loaded {len(samples)} samples from {bootstrap_input}")
@@ -1042,6 +1069,7 @@ class RLTrainer:
             raise ValueError(f"async_queue_size must be positive, got {queue_size}")
         logger.info(f"async_queue_size={queue_size}")
 
+        self.args = strategy.args
         self.rollout_queue = Queue(maxsize=queue_size)
         self.rollout_slots = Queue(maxsize=queue_size)
         for _ in range(queue_size):
@@ -1079,8 +1107,20 @@ class RLTrainer:
         return ray.get(self.generator_actor.run_eval_only.remote())
 
     def fit(self) -> None:
+        source = getattr(self.args.train, "rollout_bootstrap_resume_from", None)
+        bootstrap_resume = None
+        if source:
+            source_state, bootstrap_resume = _load_bootstrap_resume_source(source)
         if self.trainer_actor is None:
-            ray.get(self.generator_actor.fit.remote(episode=0, total_consumed_prompts=0))
+            episode = consumed = 0
+            if bootstrap_resume:
+                if Path(self.args.actor.model_name_or_path).resolve() != Path(bootstrap_resume["model"]):
+                    raise ValueError("Bootstrap producer must serve the source checkpoint's HF export")
+                episode = source_state["episode"]
+                consumed = source_state["total_consumed_prompts"]
+                ray.get(self.generator_actor.load_dataloader_state_dict.remote(source_state["data_loader_state_dict"]))
+                logger.info(f"[rollout_bootstrap] preparing from step {bootstrap_resume['step']}, prompt cursor {consumed}")
+            ray.get(self.generator_actor.fit.remote(episode, consumed, bootstrap_resume))
             return
         checkpoint_states = ray.get(self.trainer_actor.load_checkpoint_states_or_default.remote())
         ray.get(self.trainer_actor.restore_best_metric_tracker.remote(checkpoint_states))
@@ -1090,6 +1130,16 @@ class RLTrainer:
         start_episode = checkpoint_states.get("episode", 0)
         global_step = checkpoint_states.get("global_step", 0)
         total_consumed_prompts = checkpoint_states.get("total_consumed_prompts", 0)
+        if bootstrap_resume:
+            actual = Path(self.args.ckpt.path) / "_actor" / f"global_step{global_step}" / "extra_state.pt"
+            if (
+                bootstrap_resume["step"] != global_step
+                or source_state["total_consumed_prompts"] != total_consumed_prompts
+                or source_state["episode"] != start_episode
+                or bootstrap_resume["state_sha256"] != _checkpoint_state_digest(actual)
+            ):
+                raise ValueError("Bootstrap source checkpoint differs from the restored checkpoint")
+            logger.info(f"[rollout_bootstrap] consuming for step {global_step + 1} from prompt cursor {total_consumed_prompts}")
         if global_step > 0:
             ray.get(
                 [
@@ -1103,7 +1153,7 @@ class RLTrainer:
 
         ray.get(
             [
-                self.generator_actor.fit.remote(episode=start_episode, total_consumed_prompts=total_consumed_prompts),
+                self.generator_actor.fit.remote(start_episode, total_consumed_prompts, bootstrap_resume),
                 self.trainer_actor.fit.remote(global_step=global_step),
             ]
         )
