@@ -28,6 +28,11 @@ dataset, and sampling configuration in both jobs. The two jobs can use different
 counts. Use a trusted file from the rollout job on storage shared by both allocations. The bootstrap
 applies only to a fresh run and requires a drained rollout batch.
 
+For image-heavy chat rollouts, `MOLT_RENDER_CACHE=1` lets each runner reuse rendered image features
+within a rollout and render only newly appended images. `--vllm.router_policy consistent_hash` keeps
+turns with the same session ID on one engine. The router policy may differ between the bootstrap
+producer and the training run.
+
 ## Partial rollout
 
 With `--train.partial_rollout_enable`, a request that is in progress during a weight sync keeps

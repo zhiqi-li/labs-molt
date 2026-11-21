@@ -4,11 +4,12 @@
 from molt.cli.train_rl_ray import _ray_runtime_env_vars
 
 
-def test_ray_runtime_env_forwards_wandb_settings(monkeypatch):
+def test_ray_runtime_env_forwards_optional_settings(monkeypatch):
     expected = {
         "WANDB_API_KEY": "test-api-key",
         "WANDB_ENTITY": "test-entity",
         "WANDB_MODE": "offline",
+        "MOLT_RENDER_CACHE": "1",
     }
     for name, value in expected.items():
         monkeypatch.setenv(name, value)

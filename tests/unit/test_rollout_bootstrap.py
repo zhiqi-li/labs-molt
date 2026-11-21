@@ -34,7 +34,9 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
             ),
             data=SimpleNamespace(prompt_dataset=str(dataset_path)),
             rollout=SimpleNamespace(batch_size=2, num_runners=2 if produce else 4),
-            vllm=SimpleNamespace(num_engines=4 if produce else 8),
+            vllm=SimpleNamespace(
+                num_engines=4 if produce else 8, router_policy="cache_aware" if produce else "consistent_hash"
+            ),
             reward=SimpleNamespace(),
             algo=SimpleNamespace(dynamic_filtering_enable=True, dynamic_filtering_range=(0, 1)),
             eval=SimpleNamespace(steps=float("inf")),
@@ -68,6 +70,10 @@ def test_first_batch_bootstrap_continues_at_the_saved_prompt(tmp_path, monkeypat
         return payloads
 
     assert run("producer", produce=True) == []
+    saved = torch.load(bootstrap, weights_only=False, map_location="cpu")
+    assert "router_policy" not in saved["recipe"]["vllm"]
+    saved["recipe"]["vllm"]["router_policy"] = "cache_aware"  # bundle from before routing was excluded
+    torch.save(saved, bootstrap)
     first, second, done = run("consumer")
     assert [s.reload().sequences.item() for s in first[0]] == [0, 1]
     assert first[1]["total_consumed_prompts"] == 2 and first[2] == {"count": 2}
