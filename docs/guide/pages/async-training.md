@@ -18,6 +18,16 @@ optimization overlap. This page covers the switches and how to keep stale sample
 The queue size bounds how much work is buffered, and so how many updates a sample can trail the
 trainer by.
 
+## Start with a pre-generated batch
+
+Run with `--train.rollout_bootstrap_output /shared/first-rollout.pt` to generate one complete
+training batch on vLLM workers and save it along with the prompt dataloader cursor. Pass
+`--train.rollout_bootstrap_input /shared/first-rollout.pt` to the training job. The first update
+uses those samples, and the sampler continues at the saved cursor. Use the same checkpoint, agent,
+dataset, and sampling configuration in both jobs. The two jobs can use different engine and runner
+counts. Use a trusted file from the rollout job on storage shared by both allocations. The bootstrap
+applies only to a fresh run and requires a drained rollout batch.
+
 ## Partial rollout
 
 With `--train.partial_rollout_enable`, a request that is in progress during a weight sync keeps

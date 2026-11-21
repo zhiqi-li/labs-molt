@@ -183,6 +183,8 @@
 | `--train.routing_replay` | `False` | R3: capture the rollout router's per-token expert selection (vLLM) and replay it in the training forward (AutoModel RouterReplay) so MoE training/rollout routing match. MoE models only; turns on --vllm.enable_prefix_caching (the capture requires it); incompatible with --train.partial_rollout_enable (preemption drops routing). |
 | `--train.rollout_dump_dir` |  | Save each rollout batch to \<dir\>/rollout_step{N}.pt for later train-only replay. |
 | `--train.rollout_replay_dir` |  | Load \<dir\>/rollout_step{N}.pt instead of generating (train-only replay). |
+| `--train.rollout_bootstrap_output` |  | Generate one training batch, save it and the prompt cursor to this file, then exit without FSDP. |
+| `--train.rollout_bootstrap_input` |  | On a fresh run, train on the first batch from this trusted file and continue sampling at its prompt cursor. |
 | `--train.check_weight_update_equal` | `False` | After each vLLM weight broadcast, warn which params vLLM did NOT refresh (stale rollout weights). |
 
 ## `--vllm.*`
@@ -227,6 +229,7 @@
 | `--rollout.max_new_tokens` |  | Max tokens to generate per sample. If None, dynamically computed as max_len - prompt_len per sample. |
 | `--rollout.max_tokens_per_gpu` |  |  |
 | `--rollout.n_samples_per_prompt` | `1` | number of responses for each prompt in generation |
+| `--rollout.min_group_samples` |  | Train a prompt group once this many of its n_samples_per_prompt rollouts are usable; the dropped ones leave the group's baseline (PEAR keeps a group with two verified siblings). Unset: every rollout (complete groups only). A batch of partial groups need not divide across the DP ranks; balance_experiences then drops its trailing remainder (at most DP-1 samples). |
 | `--rollout.top_p` | `1.0` |  |
 | `--rollout.temperature` | `1.0` |  |
 

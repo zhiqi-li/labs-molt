@@ -15,9 +15,12 @@
 
 import asyncio
 import copy
+import hashlib
 import os
 import statistics
+import tempfile
 import time
+from pathlib import Path
 from typing import Dict, Tuple
 
 import ray
@@ -673,6 +676,27 @@ class GenerateSamplesActor:
         # consumed-prompt counter is 0 only on a fresh start (>0 once a checkpoint
         # is loaded), so it's the reliable fresh-run signal.
         fresh_start = total_consumed_prompts == 0
+        bootstrap_input = getattr(self.args.train, "rollout_bootstrap_input", None) if fresh_start else None
+        bootstrap_output = getattr(self.args.train, "rollout_bootstrap_output", None)
+        if bootstrap_input or bootstrap_output:
+            data = vars(self.args.data).copy()
+            bootstrap_recipe = {
+                "model": self.args.actor.model_name_or_path,
+                "agent": self.args.train.agent_path,
+                "seed": self.args.train.seed,
+                "data": data,
+                "rollout": {k: v for k, v in vars(self.args.rollout).items() if k != "num_runners"},
+                "vllm": {k: v for k, v in vars(self.args.vllm).items() if k != "num_engines"},
+                "reward": vars(self.args.reward),
+                "filter": (self.args.algo.dynamic_filtering_enable, self.args.algo.dynamic_filtering_range),
+                "sampling": self.generate_kwargs,
+            }
+            # Launchers can stage identical inputs in distinct run directories.
+            for section, key in ((data, "prompt_dataset"), (bootstrap_recipe, "agent")):
+                path = section[key]
+                if path and Path(path).is_file():
+                    with open(path, "rb") as stream:
+                        section[key] = hashlib.file_digest(stream, "sha256").hexdigest()
         # On resume, _next_eval_step was re-init to eval_steps (< the restored
         # global_step), so the catch-up `global_step >= _next_eval_step` would fire
         # one off-cadence eval at the resumed step every resubmit. Sync the threshold
@@ -744,6 +768,22 @@ class GenerateSamplesActor:
                     self.rollout_queue.put(("eval", global_step, eval_metrics), block=True)
                     continue
 
+                if bootstrap_input:
+                    saved = torch.load(bootstrap_input, map_location="cpu", weights_only=False, mmap=True)
+                    if saved["recipe"] != bootstrap_recipe:
+                        raise ValueError(f"Rollout bootstrap recipe differs from this run: {bootstrap_input}")
+                    samples = saved["samples"]
+                    client_states = saved["client_states"]
+                    self.prompts_dataloader.load_state_dict(client_states["data_loader_state_dict"])
+                    total_consumed_prompts = client_states["total_consumed_prompts"]
+                    pbar.update(total_consumed_prompts)
+                    for sample in samples:
+                        sample.offload()
+                    logger.info(f"[rollout_bootstrap] loaded {len(samples)} samples from {bootstrap_input}")
+                    self.rollout_queue.put((samples, client_states, saved["metrics"], 0.0, vllm_idle_wait), block=True)
+                    bootstrap_input = None
+                    continue
+
                 if self.args.train.rollout_replay_dir:
                     # Debug: replay dumped rollout batches (train-only) to iterate on the
                     # training/refit path without regenerating. When the dumps run out, report
@@ -789,6 +829,24 @@ class GenerateSamplesActor:
                         "data_loader_state_dict": {} if drained else self.prompts_dataloader.state_dict(),
                         "rollout_generator_state_dict": self.samples_generator.state_dict(),
                     }
+                    if bootstrap_output:
+                        groups = {group for sample in rollout_samples for group in rollout_and_group_ids(sample)[1]}
+                        if len(groups) != self.args.rollout.batch_size or drained:
+                            raise RuntimeError("Rollout bootstrap needs a full batch before the end of the first epoch")
+                        with tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(bootstrap_output))) as tmp:
+                            torch.save(
+                                {
+                                    "recipe": bootstrap_recipe,
+                                    "samples": [copy.copy(s).reload() for s in rollout_samples],
+                                    "client_states": client_states,
+                                    "metrics": rollout_metrics,
+                                },
+                                tmp,
+                            )
+                            tmp.flush()
+                            os.link(tmp.name, bootstrap_output)
+                        logger.info(f"[rollout_bootstrap] saved {len(groups)} groups to {bootstrap_output}")
+                        return
                     self.rollout_queue.put(
                         (rollout_samples, client_states, rollout_metrics, generation_time, vllm_idle_wait),
                         block=True,
@@ -800,6 +858,8 @@ class GenerateSamplesActor:
                     self.rollout_slots.put(global_step, block=True)
 
                 if is_exhausted:
+                    if bootstrap_output:
+                        raise RuntimeError("Dataset exhausted before producing a rollout bootstrap batch")
                     break
 
             pbar.close()
@@ -1012,6 +1072,9 @@ class RLTrainer:
         return ray.get(self.generator_actor.run_eval_only.remote())
 
     def fit(self) -> None:
+        if self.trainer_actor is None:
+            ray.get(self.generator_actor.fit.remote(episode=0, total_consumed_prompts=0))
+            return
         checkpoint_states = ray.get(self.trainer_actor.load_checkpoint_states_or_default.remote())
         ray.get(self.trainer_actor.restore_best_metric_tracker.remote(checkpoint_states))
 

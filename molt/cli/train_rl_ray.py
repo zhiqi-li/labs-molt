@@ -150,15 +150,16 @@ def train(args):
         "top_logprobs": args.algo.advantage.score_centering_top_k,
     }
 
-    # Eval-only: score --eval.dataset once and exit, with NO training. vLLM already holds the HF
-    # weights, so passing None actors keeps the whole training side unbuilt inside RLTrainer — the
-    # policy/ref/critic FSDP models never load and their GPUs go to the eval.
-    if args.eval.eval_only:
-        assert args.eval.dataset, "--eval.eval_only requires --eval.dataset."
-        eval_trainer = RLTrainer.remote(
+    # vLLM already holds the HF weights. These modes need no FSDP model workers.
+    if args.eval.eval_only or args.train.rollout_bootstrap_output:
+        rollout_trainer = RLTrainer.remote(
             args.actor.model_name_or_path, strategy, None, None, vllm_engines, router_url=router_url, **gen_kwargs
         )
-        print(f"[eval-only] {ray.get(eval_trainer.run_eval_only.remote())}", flush=True)
+        if args.train.rollout_bootstrap_output:
+            ray.get(rollout_trainer.fit.remote())
+        else:
+            assert args.eval.dataset, "--eval.eval_only requires --eval.dataset."
+            print(f"[eval-only] {ray.get(rollout_trainer.run_eval_only.remote())}", flush=True)
         return
 
     # init actor / reference / critic models
@@ -967,6 +968,14 @@ if __name__ == "__main__":
         help="Load <dir>/rollout_step{N}.pt instead of generating (train-only replay).",
     )
     parser.add_argument(
+        "--train.rollout_bootstrap_output",
+        help="Generate one training batch, save it and the prompt cursor to this file, then exit without FSDP.",
+    )
+    parser.add_argument(
+        "--train.rollout_bootstrap_input",
+        help="On a fresh run, train on the first batch from this trusted file and continue sampling at its prompt cursor.",
+    )
+    parser.add_argument(
         "--train.check_weight_update_equal",
         action="store_true",
         default=False,
@@ -1113,6 +1122,16 @@ if __name__ == "__main__":
             "--train.partial_rollout_enable so the in-flight surplus survives the weight refit."
         )
         args.train.partial_rollout_enable = True
+
+    bootstrap_input = args.train.rollout_bootstrap_input
+    bootstrap_output = args.train.rollout_bootstrap_output
+    if bootstrap_input or bootstrap_output:
+        if bootstrap_input and bootstrap_output:
+            raise ValueError("Choose one of --train.rollout_bootstrap_input and --train.rollout_bootstrap_output")
+        if args.eval.eval_only or args.train.rollout_replay_dir or args.train.partial_rollout_enable:
+            raise ValueError("Rollout bootstrap requires a training dataset and a drained rollout batch")
+        if bootstrap_output and (args.ckpt.load_enable or args.eval.eval_at_start):
+            raise ValueError("Rollout bootstrap output requires a fresh run without baseline eval")
 
     # --- Algorithm checks ---
     # Group-relative estimators need >1 sample per prompt to form a baseline during training;
