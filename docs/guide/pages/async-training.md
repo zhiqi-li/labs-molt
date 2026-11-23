@@ -25,8 +25,11 @@ training batch on vLLM workers and save it along with the prompt dataloader curs
 `--train.rollout_bootstrap_input /shared/first-rollout.pt` to the training job. The first update
 uses those samples, and the sampler continues at the saved cursor. Use the same checkpoint, agent,
 dataset, and sampling configuration in both jobs. The two jobs can use different engine and runner
-counts. Use a trusted file from the rollout job on storage shared by both allocations. The bootstrap
-applies only to a fresh run and requires a drained rollout batch.
+counts. Use a trusted file from the rollout job on storage shared by both allocations.
+With `--train.partial_rollout_enable` and a generation batch larger than the training batch,
+the producer saves the first complete training batch and cancels surplus in-flight groups.
+The saved cursor includes all dispatched prompts, including cancelled groups. For checkpoint
+continuations, bind both jobs to the same actor checkpoint with `--train.rollout_bootstrap_resume_from`.
 
 For image-heavy chat rollouts, `MOLT_RENDER_CACHE=1` lets each runner reuse rendered image features
 within a rollout and render only newly appended images. `--vllm.router_policy consistent_hash` keeps

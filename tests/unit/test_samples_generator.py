@@ -142,6 +142,44 @@ def test_generate_samples_emits_short_batch_when_dataloader_exhausted(monkeypatc
     assert generator._inflight_rollouts == []
 
 
+def test_partial_preroll_cancels_stragglers_and_keeps_dispatched_cursor(monkeypatch):
+    generator = object.__new__(SamplesGenerator)
+    generator.args = SimpleNamespace(
+        rollout=SimpleNamespace(batch_size=3, n_samples_per_prompt=2, vllm_generate_batch_size=5),
+        algo=SimpleNamespace(dynamic_filtering_enable=False),
+        train=SimpleNamespace(partial_rollout_enable=True, rollout_bootstrap_output="first-rollout.pt"),
+    )
+    generator.prompts_dataloader = _prompt_loader(10)
+    part_ids = iter(range(14))
+    runner = SimpleNamespace(run_group=SimpleNamespace(remote=lambda *a, **kw: f"part-{next(part_ids)}"))
+    generator.agent_runners = [runner]
+    generator._rr = 0
+    groups = {}
+    def join(*parts):
+        name = f"group-{len(groups)}"
+        groups[name] = parts
+        return name
+    monkeypatch.setattr(samples_generator._gather_group, "remote", join, raising=False)
+    def wait(refs, num_returns, timeout=None, fetch_local=True):
+        if timeout is not None:
+            assert set(refs) == {part for group in ("group-0", "group-4", "group-5", "group-6") for part in groups[group]}
+            return [], refs
+        return [refs[1]], [refs[0], *refs[2:]]
+    monkeypatch.setattr(samples_generator.ray, "wait", wait)
+    monkeypatch.setattr(samples_generator.ray, "get", lambda group: [(_sample(group), None), (_sample(group), None)])
+    cancelled = []
+    monkeypatch.setattr(samples_generator.ray, "cancel", lambda ref, *, recursive: cancelled.append(ref))
+
+    samples, _, prompts_dispatched, exhausted = generator.generate_samples()
+
+    assert [sample.group_ids[0] for sample in samples] == ["group-1", "group-1", "group-2", "group-2", "group-3", "group-3"]
+    assert prompts_dispatched == 7 and next(generator._dataloader_iter)[0] == 7 and not exhausted
+    assert generator._inflight_rollouts == [] and generator._finished_samples == []
+    assert cancelled == [
+        ref for group in ("group-0", "group-4", "group-5", "group-6") for ref in (group, *groups[group])
+    ]
+
+
 def _wire_eval_generator(generator, monkeypatch, num_prompts):
     generator.eval_dataloader = _prompt_loader(num_prompts)
     dispatch_sizes = []

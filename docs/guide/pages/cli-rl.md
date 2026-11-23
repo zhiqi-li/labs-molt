@@ -184,7 +184,8 @@
 | `--train.rollout_dump_dir` |  | Save each rollout batch to \<dir\>/rollout_step{N}.pt for later train-only replay. |
 | `--train.rollout_replay_dir` |  | Load \<dir\>/rollout_step{N}.pt instead of generating (train-only replay). |
 | `--train.rollout_bootstrap_output` |  | Generate one training batch, save it and the prompt cursor to this file, then exit without FSDP. |
-| `--train.rollout_bootstrap_input` |  | On a fresh run, train on the first batch from this trusted file and continue sampling at its prompt cursor. |
+| `--train.rollout_bootstrap_input` |  | Train on the first batch from this trusted file and continue sampling at its prompt cursor. |
+| `--train.rollout_bootstrap_resume_from` |  | Published _actor/global_stepN directory binding bootstrap to the restored checkpoint and prompt cursor. |
 | `--train.check_weight_update_equal` | `False` | After each vLLM weight broadcast, warn which params vLLM did NOT refresh (stale rollout weights). |
 
 ## `--vllm.*`

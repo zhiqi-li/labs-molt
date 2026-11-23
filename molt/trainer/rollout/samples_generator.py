@@ -233,6 +233,9 @@ class SamplesGenerator:
         groups_per_batch = self.args.rollout.batch_size
         inflight_capacity = getattr(self.args.rollout, "vllm_generate_batch_size", None) or groups_per_batch
         partial_rollout = getattr(getattr(self.args, "train", None), "partial_rollout_enable", False)
+        partial_bootstrap = partial_rollout and getattr(self.args.train, "rollout_bootstrap_output", None)
+        if partial_bootstrap:
+            self._bootstrap_parts = {}
         dynamic_filtering = self.args.algo.dynamic_filtering_enable
 
         def finished_group_count() -> int:
@@ -271,6 +274,8 @@ class SamplesGenerator:
             # Take the first rollout to finish; the slow ones keep generating in vLLM.
             ready, self._inflight_rollouts = ray.wait(self._inflight_rollouts, num_returns=1)
             for finished_rollout in ready:
+                if partial_bootstrap:
+                    del self._bootstrap_parts[finished_rollout]
                 groups_completed += 1
                 # Dropped groups (filtered, or short of a rollout) come back empty; their
                 # slot is refilled with a fresh prompt on the next iteration.
@@ -315,6 +320,22 @@ class SamplesGenerator:
             else:
                 leftover_samples.append(sample)
         self._finished_samples = leftover_samples
+
+        if partial_bootstrap:
+            # One-shot preroll has no next step in this process. Cancel the join and the actor
+            # requests that feed it, while keeping the cursor after all dispatched prompts.
+            requests = []
+            for group, parts in self._bootstrap_parts.items():
+                ray.cancel(group, recursive=False)
+                for part in parts:
+                    ray.cancel(part, recursive=False)
+                requests.extend(parts)
+            if requests:
+                ray.wait(requests, num_returns=len(requests), timeout=5, fetch_local=False)
+                logger.info(f"[rollout_bootstrap] cancelled {len(self._bootstrap_parts)} surplus groups")
+            self._inflight_rollouts.clear()
+            self._finished_samples.clear()
+            del self._bootstrap_parts
 
         # Exhausted only once the dataloader is done AND nothing is buffered or in flight.
         exhausted = self._dataloader_iter is None and not self._finished_samples and not self._inflight_rollouts
@@ -520,7 +541,10 @@ class SamplesGenerator:
                         group_id=group_id,
                     )
                 )
-            refs.append(_gather_group.remote(*parts))
+            group = _gather_group.remote(*parts)
+            refs.append(group)
+            if hasattr(self, "_bootstrap_parts"):
+                self._bootstrap_parts[group] = parts
         return refs
 
     @staticmethod
