@@ -72,6 +72,24 @@ def test_balance_experiences_equal_count_and_length_sorted():
         assert block_lengths == sorted(block_lengths, reverse=True)
 
 
+@pytest.mark.parametrize("extra_text", [False, True])
+def test_balance_experiences_aligns_media_across_context_parallel_groups(monkeypatch, extra_text):
+    samples = [_len_sample(n, i) for i, n in enumerate((170, 160, 154, 150, 66, 50))]
+    for sample in (samples[0], samples[2], samples[3], samples[5]):
+        sample.mm_train_inputs = [{"pixel_values": torch.ones(1), "image_grid_thw": torch.ones(1)}]
+    monkeypatch.setattr(experience_mod.ray, "put", lambda _: object())
+    samples[2].offload()
+    assert samples[2].mm_train_inputs is None
+    if extra_text:
+        samples.append(_len_sample(20, 6))
+
+    balanced = balance_experiences(samples, _args(cp=8, actor_gpus=16))
+    assert {id(s) for s in balanced} == {id(s) for s in samples[:6]}
+    signatures = [s.media_keys for s in balanced]
+    vision = ("image_grid_thw", "pixel_values")
+    assert signatures[:3] == signatures[3:] == [(), vision, vision]
+
+
 def _grpo_maker():
     """A real RemoteExperienceMaker: only `strategy.args` and the KL controller are stubbed, so a
     new step on the compute_advantages path does not need another binding here."""
