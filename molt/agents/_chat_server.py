@@ -255,6 +255,9 @@ class ChatServerState:
 
     def discard(self, session_id: str):
         self.sessions.pop(session_id, None)
+        discard_fn = getattr(self.transport, "discard_session", None)
+        if callable(discard_fn):
+            discard_fn(session_id)
 
 
 # ===========================================================================

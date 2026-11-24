@@ -254,7 +254,7 @@ class RouterGenerateClient:
     # image processor's per-image budget is independent of the image count below ~512 images; checked bitwise on
     # the M2 processor), so a turn renders only its new images and reuses the earlier items. mm_placeholders are
     # rebuilt by _align_features_to_canonical anyway. Off by default; the engine-side mm cache stays off.
-    RENDER_CACHE_SESSIONS = 128
+    RENDER_CACHE_SESSIONS = 16
 
     def __init__(self, http_client, *, model_name="policy", image_token_id=None, engine_urls=None):
         self.http = http_client
@@ -265,6 +265,11 @@ class RouterGenerateClient:
         self._render_cache = OrderedDict()  # session id -> (images, kwargs_data items, mm_hashes items), LRU
         self._delta_mm_on = self._render_cache_on and float(os.environ.get("MOLT_VLLM_MM_CACHE_GB", "0") or 0) > 0
         self._sent_mm_hashes = OrderedDict()  # session id -> (target_base, set[mm_hash]), LRU
+
+    def discard_session(self, session_id: str) -> None:
+        """Release per-session cached render features & sent hashes as soon as a rollout ends."""
+        self._render_cache.pop(session_id, None)
+        self._sent_mm_hashes.pop(session_id, None)
 
     def _engine_for(self, session_id: str | None) -> str | None:
         if not self._engine_urls:

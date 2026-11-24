@@ -138,3 +138,8 @@ def test_direct_routing_and_delta_mm_with_500_fallback(monkeypatch):
     gen_calls = [(u, j) for u, j, _ in http.calls if u.endswith("/inference/v1/generate")]
     assert len(gen_calls) == 5
     assert gen_calls[4][1]["features"]["kwargs_data"]["image"] == [None, None, None]
+
+    # Session close immediately releases per-session render cache and sent hashes (prevents host RAM leak).
+    assert "sess-A" in client._render_cache and "sess-A" in client._sent_mm_hashes
+    client.discard_session("sess-A")
+    assert "sess-A" not in client._render_cache and "sess-A" not in client._sent_mm_hashes
