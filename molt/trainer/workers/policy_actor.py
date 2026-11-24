@@ -810,6 +810,7 @@ class PolicyModelActor(BaseModelActor):
         deployable HF model directory.
         """
         args = self.strategy.args
+        self.strategy.checkpoint.wait_async_hf_export()
 
         self.strategy.save_model(
             self.actor,
@@ -861,9 +862,10 @@ class PolicyModelActor(BaseModelActor):
     def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
         args = self.strategy.args
         client_states = client_states or {}
+        dcp_root = os.path.join(args.ckpt.path, "_actor")
         self.strategy.save_ckpt(
             self.actor.model,
-            os.path.join(args.ckpt.path, "_actor"),
+            dcp_root,
             tag,
             args.ckpt.dcp_max_num,
             args.ckpt.max_mem,
@@ -874,9 +876,28 @@ class PolicyModelActor(BaseModelActor):
             scheduler=self.actor_scheduler,
         )
         if self.save_hf_ckpt:
-            # Versioned HF export mirrors the DCP layout (_actor/<tag>) and gets its own
-            # recency pruning, so save_hf can run every step without unbounded disk growth.
-            hf_root = os.path.join(args.ckpt.path, "_hf")
-            self.strategy.save_model(self.actor, self.tokenizer, os.path.join(hf_root, tag))
-            self.strategy.prune_checkpoints(hf_root, tag, args.ckpt.max_num, args.ckpt.max_mem)
+            save_hf_steps = max(1, int(getattr(args.ckpt, "save_hf_steps", 1) or 1))
+            step_num = client_states.get("global_step")
+            should_export_hf = tag.startswith("best") or step_num is None or (int(step_num) % save_hf_steps == 0)
+            if should_export_hf:
+                # Versioned HF export mirrors the DCP layout (_actor/<tag>) and gets its own
+                # recency pruning, so save_hf can run every step without unbounded disk growth.
+                hf_root = os.path.join(args.ckpt.path, "_hf")
+                peft_config = getattr(self.actor, "peft_config", None)
+                if getattr(args.ckpt, "async_save_hf", False) and peft_config is None:
+                    self.strategy.checkpoint.start_async_hf_export_from_dcp(
+                        self.actor,
+                        self.tokenizer,
+                        os.path.join(dcp_root, tag, "model"),
+                        hf_root,
+                        tag,
+                        args.ckpt.max_num,
+                        args.ckpt.max_mem,
+                    )
+                else:
+                    self.strategy.save_model(self.actor, self.tokenizer, os.path.join(hf_root, tag))
+                    self.strategy.prune_checkpoints(hf_root, tag, args.ckpt.max_num, args.ckpt.max_mem)
         torch_dist_barrier_and_cuda_sync()
+
+    def wait_async_hf_export(self):
+        self.strategy.checkpoint.wait_async_hf_export()
