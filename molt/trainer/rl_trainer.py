@@ -700,7 +700,11 @@ class GenerateSamplesActor:
                 for k, v in vars(self.args.rollout).items()
                 if k not in {"num_runners", "vllm_generate_batch_size", "max_tokens_per_gpu"}
             },
-            "vllm": {k: v for k, v in vars(self.args.vllm).items() if k not in {"num_engines", "router_policy"}},
+            "vllm": {
+                k: v
+                for k, v in vars(self.args.vllm).items()
+                if k not in {"num_engines", "router_policy", "gpu_memory_utilization"}
+            },
             "reward": vars(self.args.reward),
             "filter": (self.args.algo.dynamic_filtering_enable, self.args.algo.dynamic_filtering_range),
             "sampling": self.generate_kwargs,
