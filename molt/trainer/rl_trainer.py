@@ -698,7 +698,7 @@ class GenerateSamplesActor:
             "rollout": {
                 k: v
                 for k, v in vars(self.args.rollout).items()
-                if k not in {"num_runners", "vllm_generate_batch_size"}
+                if k not in {"num_runners", "vllm_generate_batch_size", "max_tokens_per_gpu"}
             },
             "vllm": {k: v for k, v in vars(self.args.vllm).items() if k not in {"num_engines", "router_policy"}},
             "reward": vars(self.args.reward),
@@ -810,8 +810,9 @@ class GenerateSamplesActor:
 
                 if bootstrap_input:
                     saved = torch.load(bootstrap_input, map_location="cpu", weights_only=False, mmap=True)
-                    # These serving settings can change when consuming an older pre-generated batch.
+                    # These serving/trainer-batching settings can change when consuming an older pre-generated batch.
                     saved["recipe"]["rollout"].pop("vllm_generate_batch_size", None)
+                    saved["recipe"]["rollout"].pop("max_tokens_per_gpu", None)
                     saved["recipe"]["vllm"].pop("router_policy", None)
                     if saved["recipe"] != bootstrap_recipe:
                         raise ValueError(f"Rollout bootstrap recipe differs from this run: {bootstrap_input}")
