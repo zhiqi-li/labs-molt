@@ -551,7 +551,21 @@ def create_vllm_engines(
         # train the MTP head (matches verl/NeMo-RL: main-head-only RL loss). vLLM
         # errors at init if the served checkpoint has no MTP head (e.g.
         # Nemotron-Nano-Omni — see README).
-        if mtp_num_speculative_tokens and mtp_num_speculative_tokens > 0:
+        spec_method = os.environ.get("MOLT_VLLM_SPEC_METHOD", "").strip()
+        if spec_method:
+            spec_cfg = {
+                "method": spec_method,
+                "num_speculative_tokens": int(os.environ.get("MOLT_VLLM_SPEC_TOKENS", "8")),
+            }
+            if spec_method == "suffix":
+                spec_cfg["suffix_decoding_max_tree_depth"] = int(
+                    os.environ.get("MOLT_VLLM_SPEC_SUFFIX_DEPTH", "24")
+                )
+            elif spec_method == "ngram":
+                spec_cfg["prompt_lookup_max"] = int(os.environ.get("MOLT_VLLM_SPEC_NGRAM_MAX", "4"))
+                spec_cfg["prompt_lookup_min"] = int(os.environ.get("MOLT_VLLM_SPEC_NGRAM_MIN", "2"))
+            actor_kwargs["speculative_config"] = spec_cfg
+        elif mtp_num_speculative_tokens and mtp_num_speculative_tokens > 0:
             actor_kwargs["speculative_config"] = {
                 "method": "mtp",
                 "num_speculative_tokens": mtp_num_speculative_tokens,
