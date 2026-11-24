@@ -23,6 +23,13 @@ shard with the sequence, so `--fsdp.cp_size` composes with `--data.image_key` an
 `--train.routing_replay`. Sample packing, `--fsdp.packing_samples`, is text-only and off by
 default. Under context parallelism it takes the THD path.
 
+For RL rollouts that mix text and multimodal inputs, the trainer aligns media
+keys at each microbatch across data-parallel ranks (including non-colocated
+reference models with a different DP size) so FSDP executes matching
+collectives. Within each media group it balances sequence lengths, preserves
+complete prompt groups when trimming remainders, and syncs deferred gradients
+at the final microbatch of each independent media key.
+
 ## Model backend and optimizer
 
 NeMo AutoModel is the primary path: native TP, EP, and CP, a custom MoE and EP parallelizer, and

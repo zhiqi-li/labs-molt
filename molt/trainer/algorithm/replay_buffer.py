@@ -74,6 +74,10 @@ class NaiveReplayBuffer:
     def clear(self) -> None:
         self.items.clear()
 
+    def has_mixed_media(self) -> bool:
+        """True when buffered samples do not all share the same media_keys."""
+        return len({item.media_keys for item in self.items}) > 1
+
     def __len__(self) -> int:
         if self.dynamic_batch:
             return len(self.dynamic_indices)
@@ -107,10 +111,18 @@ class NaiveReplayBuffer:
             num_steps = 1 if sample_lengths else 0
         else:
             local_train_batch_size = args.train.batch_size // dp_size
-            # Async generation can deliver a short buffer at episode boundaries.
-            # Also, multi-turn agents may flatten to a variable number of samples
-            # per prompt — use the actual buffer size, not the formula.
-            num_steps = len(sample_lengths) // local_train_batch_size
+            # Async generation can deliver a short buffer at episode boundaries, and
+            # per-media DP alignment can trim a single-step rollout below one full batch.
+            # Run one shorter step rather than silently dropping the entire batch to 0 steps.
+            if 0 < len(sample_lengths) < local_train_batch_size:
+                strategy.print(
+                    f"[ReplayBuffer] shortening train batch per rank from {local_train_batch_size} "
+                    f"to {len(sample_lengths)} for trimmed buffer."
+                )
+                local_train_batch_size = len(sample_lengths)
+                num_steps = 1
+            else:
+                num_steps = len(sample_lengths) // local_train_batch_size
             # balance_experiences only equalizes the per-rank count to a multiple
             # of dp_size, not of local_train_batch_size, so a remainder here is
             # dropped from this update. Surface it instead of dropping silently.
@@ -121,35 +133,46 @@ class NaiveReplayBuffer:
                     f"{local_train_batch_size}-sample train batch (buffer={len(sample_lengths)})."
                 )
 
-        # split by train_batch_size, sync num_microbatches across dp
+        # Group each optimizer step's samples by media_keys (text first, media last) so
+        # every DP rank executes the same media type on each microbatch and deferred
+        # gradient sync still includes the vision tower on the last microbatch.
+        step_groups: List[List[List[int]]] = []
         num_microbatches = []
         for i in range(num_steps):
             start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
-            num_microbatches.append(
-                get_minimum_num_micro_batch_size(
-                    sample_lengths[start:end],
-                    args.train.max_tokens_per_gpu,
-                    args.fsdp.cp_size,
-                    args.fsdp.tp_size,
+            by_media = {}
+            for idx in range(start, end):
+                by_media.setdefault(self.items[idx].media_keys, []).append(idx)
+            groups = [by_media[media] for media in sorted(by_media)]
+            step_groups.append(groups)
+            for group in groups:
+                num_microbatches.append(
+                    get_minimum_num_micro_batch_size(
+                        [sample_lengths[idx] for idx in group],
+                        args.train.max_tokens_per_gpu,
+                        args.fsdp.cp_size,
+                        args.fsdp.tp_size,
+                    )
                 )
-            )
 
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
         num_microbatches = strategy.all_reduce(num_microbatches, op="max")
         num_microbatches = num_microbatches.tolist()
 
-        # balance the number of microbatches across steps
+        # Partition each (step, media) group independently into the synced microbatch count.
         micro_batch_indices = []
         data_partitions = []
-        for i, num_mbs in enumerate(num_microbatches):
-            start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
-            samples = sample_lengths[start:end]
-            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)  # List[List[int]], index
-            for j in range(num_mbs):
-                for k in range(len(partitions[j])):
-                    partitions[j][k] += start
-            micro_batch_indices.extend(partitions)
-            data_partitions.append(partitions)
+        mb_iter = iter(num_microbatches)
+        for groups in step_groups:
+            step_partitions = []
+            for group in groups:
+                num_mbs = next(mb_iter)
+                partitions = get_seqlen_balanced_partitions(
+                    [sample_lengths[idx] for idx in group], num_mbs, equal_size=False
+                )
+                step_partitions.extend([[group[k] for k in partition] for partition in partitions])
+            micro_batch_indices.extend(step_partitions)
+            data_partitions.append(step_partitions)
         self.dynamic_indices = micro_batch_indices
         self.sample_batch_size = 1
 
