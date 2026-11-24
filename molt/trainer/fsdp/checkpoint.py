@@ -27,10 +27,15 @@ import contextlib
 import json
 import math
 import os
+import shutil
+import subprocess
+import sys
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+from molt.trainer.fsdp.hf_export import install_fast_safetensors_consolidation
 
 
 class CheckpointManager:
@@ -40,6 +45,8 @@ class CheckpointManager:
 
     def __init__(self, strategy) -> None:
         self.strategy = strategy
+        self._async_hf_proc: subprocess.Popen | None = None
+        self._async_hf_tag: str | None = None
 
     @staticmethod
     def _checkpoint_source(model: nn.Module) -> tuple[str | None, str | None]:
@@ -60,6 +67,7 @@ class CheckpointManager:
         # consolidated HF safetensors that vLLM can hot-load. LoRA runs export as a PEFT
         # adapter directory (is_peft) instead: a full-weight export would write the frozen
         # base plus loose lora_A/lora_B keys that HF and vLLM ignore.
+        install_fast_safetensors_consolidation()
         peft_config = getattr(model, "peft_config", None)
         model = self.strategy._unwrap_model(model)
         # Declare the export precision on the config and every nested sub-config: loaders (vLLM/HF)
@@ -77,6 +85,107 @@ class CheckpointManager:
         self._promote_hf_export(output_dir)
         if dist.is_initialized():
             dist.barrier()
+
+    def wait_async_hf_export(self) -> None:
+        """Join any in-flight background HF safetensors consolidation subprocess on rank 0."""
+        proc = self._async_hf_proc
+        tag = self._async_hf_tag
+        if proc is None:
+            return
+        self._async_hf_proc = None
+        self._async_hf_tag = None
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"Async HF export subprocess for {tag} failed with exit code {rc}")
+
+    def start_async_hf_export_from_dcp(
+        self,
+        model: nn.Module,
+        tokenizer,
+        dcp_model_dir: str,
+        hf_root: str,
+        tag: str,
+        max_num: int,
+        max_mem: float,
+    ) -> None:
+        """Spawn a background rank-0 subprocess to consolidate ``dcp_model_dir`` into ``hf_root/tag``.
+
+        Hardlinks the already-written DCP safetensors shards into a hidden staging directory so
+        training resumes immediately and later ``_actor`` pruning cannot invalidate the inputs.
+        """
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
+
+        self.wait_async_hf_export()
+
+        unwrapped = self.strategy._unwrap_model(model)
+        from molt.utils.utils import convert_to_torch_dtype
+
+        self._set_config_dtype(unwrapped.config, convert_to_torch_dtype(self.strategy.param_dtype))
+        _, model_repo_id = self._checkpoint_source(unwrapped)
+
+        os.makedirs(hf_root, exist_ok=True)
+        staging_root = os.path.join(hf_root, f".staging_{tag}_{os.getpid()}")
+        shards_dir = os.path.join(staging_root, "shards")
+        out_dir = os.path.join(staging_root, "out")
+        if os.path.exists(staging_root):
+            shutil.rmtree(staging_root, ignore_errors=True)
+        os.makedirs(shards_dir, exist_ok=True)
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Hardlink DCP safetensors shards (instant, zero extra disk space, immune to _actor pruning).
+        for entry in sorted(os.listdir(dcp_model_dir)):
+            if not entry.endswith(".safetensors"):
+                continue
+            src = os.path.join(dcp_model_dir, entry)
+            dst = os.path.join(shards_dir, entry)
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+
+        # Save lightweight HF config + generation_config + tokenizer/processor metadata synchronously (~0.2s).
+        unwrapped.config.save_pretrained(out_dir)
+        gen_cfg = getattr(unwrapped, "generation_config", None)
+        if gen_cfg is not None:
+            with contextlib.suppress(Exception):
+                gen_cfg.save_pretrained(out_dir)
+        if tokenizer is not None:
+            tokenizer.save_pretrained(out_dir)
+        # Preserve auxiliary metadata files (processor_config.json, chat_template.jinja, etc.) from base repo.
+        if model_repo_id and os.path.isdir(model_repo_id):
+            for name in ("processor_config.json", "preprocessor_config.json", "chat_template.jinja", "video_preprocessor_config.json"):
+                src = os.path.join(model_repo_id, name)
+                dst = os.path.join(out_dir, name)
+                if os.path.isfile(src) and not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "molt.trainer.fsdp.hf_export",
+            "--staging-root",
+            staging_root,
+            "--hf-root",
+            hf_root,
+            "--tag",
+            tag,
+            "--cast-dtype",
+            str(self.strategy.param_dtype),
+            "--num-threads",
+            os.environ.get("MOLT_HF_EXPORT_THREADS", "4"),
+            "--max-num",
+            str(max_num),
+            "--max-mem",
+            str(max_mem),
+        ]
+        if model_repo_id and os.path.isdir(model_repo_id):
+            cmd.extend(["--reference-model-dir", model_repo_id])
+        self._async_hf_proc = subprocess.Popen(cmd)
+        self._async_hf_tag = tag
+        self.strategy.print(
+            f"[ckpt] Started async HF consolidation for {tag} (pid={self._async_hf_proc.pid}); resuming training."
+        )
 
     @staticmethod
     def _set_config_dtype(config, dtype: torch.dtype) -> None:
@@ -120,6 +229,7 @@ class CheckpointManager:
 
         model_cache_dir, model_repo_id = self._checkpoint_source(model) if model is not None else (None, None)
         os.makedirs(output_dir, exist_ok=True)
+        staging_dir = (os.environ.get("TMPDIR") or "/tmp") if save_consolidated else None
         config = CheckpointingConfig(
             enabled=True,
             checkpoint_dir=output_dir,
@@ -127,6 +237,7 @@ class CheckpointManager:
             model_cache_dir=model_cache_dir,
             model_repo_id=model_repo_id,
             save_consolidated=save_consolidated,
+            staging_dir=staging_dir,
             original_model_root_dir=model_cache_dir,
             is_peft=is_peft,
         )
@@ -258,7 +369,7 @@ class CheckpointManager:
             subdirs = [
                 (os.path.join(ckpt_path, name), os.path.getmtime(os.path.join(ckpt_path, name)))
                 for name in os.listdir(ckpt_path)
-                if os.path.isdir(os.path.join(ckpt_path, name))
+                if not name.startswith(".") and os.path.isdir(os.path.join(ckpt_path, name))
             ]
             regular_subdirs = [
                 (path, mtime)
