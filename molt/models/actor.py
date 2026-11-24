@@ -125,7 +125,7 @@ class Actor(BaseModel):
                     if target_len is not None and ids.shape[1] < target_len:
                         ids = F.pad(ids, (0, 0, 0, target_len - ids.shape[1]))
                     ids = self._cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0)
-                elif self.packing_samples:
+                elif self.packing_samples and not getattr(self, "is_vlm", False):
                     ids = F.pad(ids, (0, 0, 0, -ids.shape[1] % (2 * self.cp_size)))
                     ids = self._cp_sharder.shard_token_tensor(ids, fill=0)
                 else:
@@ -157,7 +157,7 @@ class Actor(BaseModel):
                         if target_len is not None and active.shape[1] < target_len:
                             active = F.pad(active, (0, target_len - active.shape[1]), value=False)
                         local_active_mask = self._cp_sharder.shard_token_tensor(active, seq_dim=1, fill=0).bool()
-                    elif self.packing_samples:
+                    elif self.packing_samples and not getattr(self, "is_vlm", False):
                         active = F.pad(active, (0, -active.shape[1] % (2 * self.cp_size)), value=False)
                         local_active_mask = self._cp_sharder.shard_token_tensor(active, fill=0).bool()
                     else:

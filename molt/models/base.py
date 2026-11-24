@@ -716,7 +716,8 @@ class BaseModel(nn.Module):
             # derives from it — labels, VLM token-type ids, positions and the R3 ids must
             # describe the same rows — with the pad id the sharder masks by; the restore trims
             # the tail back off. round_robin needs none of this: its sharder pads the stream itself.
-            if self.packing_samples and self.cp_size > 1 and attention_mask is not None:
+            is_thd_pack = self.packing_samples and not getattr(self, "is_vlm", False)
+            if is_thd_pack and self.cp_size > 1 and attention_mask is not None:
                 pad = -seqlen % (2 * self.cp_size)
                 if pad:
                     pad_id = getattr(getattr(self.model, "config", None), "pad_token_id", None) or 0
@@ -728,7 +729,7 @@ class BaseModel(nn.Module):
                         # -1 = "no captured routing", so RouterReplay keeps the live choice
                         routed_experts = F.pad(routed_experts, (0, pad), value=-1)
 
-            if self.cp_size > 1 and attention_mask is not None and not self.packing_samples:
+            if self.cp_size > 1 and attention_mask is not None and not is_thd_pack:
                 # Align sequence length to a multiple of 16 * cp_size (default) so each CP rank's
                 # local length is divisible by 16 (avoids Triton dual divisible/non-divisible
                 # kernel specializations). Causal attention/GDN never reads trailing pad tokens,
@@ -818,7 +819,7 @@ class BaseModel(nn.Module):
                 # the sharder takes the aux streams and the model shards its own primary.
                 # THD DSA (GLM): the sharder flattens [B,S] to [B*S] and contiguous-shards
                 # from seq_lens, matching the recipe's fixed-length+padding CP.
-                if self.packing_samples:
+                if is_thd_pack:
                     seq_lens = attention_mask.sum(-1, keepdim=True).to(torch.int32)
                     cp_batch = {
                         "input_ids": sequences,
