@@ -30,6 +30,7 @@ from transformers.optimization import get_scheduler
 
 from molt.models.utils import resolve_ac_mode
 from molt.trainer.fsdp.checkpoint import CheckpointManager
+from molt.trainer.fsdp.fla_opt import install_fla_coarse_nb_bucketing
 from molt.trainer.fsdp.optimizer_offload import CpuOptimizerOffloader, local_shard
 from molt.utils.distributed_sampler import DistributedSampler
 
@@ -174,6 +175,10 @@ class FsdpStrategy:
         if not dist.is_initialized():
             backend = "cuda:nccl,cpu:gloo" if self.cpu_offload else "nccl"
             dist.init_process_group(backend=backend, timeout=timeout)
+
+        # Coarsen FLA Triton autotune NB buckets before any model forward runs to avoid
+        # 45-80s per-length compilation spikes on variable-length RL sequences.
+        install_fla_coarse_nb_bucketing()
 
         self.world_size = dist.get_world_size()
         if self.world_size == 1 and self.cpu_offload:

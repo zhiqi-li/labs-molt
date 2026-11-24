@@ -670,6 +670,26 @@ class BaseModel(nn.Module):
                         # -1 = "no captured routing", so RouterReplay keeps the live choice
                         routed_experts = F.pad(routed_experts, (0, pad), value=-1)
 
+            if self.cp_size > 1 and attention_mask is not None and not self.packing_samples:
+                # Align sequence length to a multiple of 16 * cp_size (default) so each CP rank's
+                # local length is divisible by 16 (avoids Triton dual divisible/non-divisible
+                # kernel specializations). Causal attention/GDN never reads trailing pad tokens,
+                # and _restore_full_sequence trims back to original seqlen.
+                align_env = os.environ.get("MOLT_SEQ_ALIGN", "1")
+                if align_env != "0":
+                    align_mult = 16 * self.cp_size if align_env == "1" else int(align_env)
+                    if align_mult > 1 and align_mult % (2 * self.cp_size) != 0:
+                        align_mult = ((align_mult + 2 * self.cp_size - 1) // (2 * self.cp_size)) * (2 * self.cp_size)
+                    pad = -seqlen % align_mult if align_mult > 1 else 0
+                    if pad:
+                        pad_id = getattr(getattr(self.model, "config", None), "pad_token_id", None) or 0
+                        sequences = F.pad(sequences, (0, pad), value=pad_id)
+                        attention_mask = F.pad(attention_mask, (0, pad), value=0)
+                        if position_ids is not None:
+                            position_ids = F.pad(position_ids, (0, pad), value=0)
+                        if routed_experts is not None:
+                            routed_experts = F.pad(routed_experts, (0, pad), value=-1)
+
             # https://github.com/OpenRLHF/OpenRLHF/issues/217
             rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
             forward_attention_mask = attention_mask
