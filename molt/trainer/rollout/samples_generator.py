@@ -254,7 +254,7 @@ class WarmRolloutWriter:
             return None
 
 
-def _canonical_warm_recipe(recipe: Any) -> Any:
+def _canonical_warm_recipe(recipe: object) -> object:
     """Drop trainer-side batching knobs (e.g. rollout.max_tokens_per_gpu) that never affect rollout generation."""
     if not isinstance(recipe, dict):
         return recipe
