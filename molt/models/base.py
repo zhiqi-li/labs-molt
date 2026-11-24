@@ -829,8 +829,33 @@ class BaseModel(nn.Module):
             )
             if output_hidden_states:
                 forward_kwargs["output_hidden_states"] = True
-            with replay_ctx:
-                output = self.model(**forward_kwargs)
+            vision_token = None
+            if (
+                cp_forward
+                and getattr(self, "is_vlm", False)
+                and self.cp_size > 1
+                and os.environ.get("MOLT_CP_VISION_SHARD", "1") == "1"
+            ):
+                try:
+                    from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+                        CpVisionFrameShardingConfig,
+                        reset_cp_vision_group,
+                        set_cp_vision_group,
+                    )
+
+                    vision_token = set_cp_vision_group(
+                        self.device_mesh["cp"].get_group(),
+                        config=CpVisionFrameShardingConfig(enabled=True),
+                        spans_only_cp=True,
+                    )
+                except ImportError:
+                    vision_token = None
+            try:
+                with replay_ctx:
+                    output = self.model(**forward_kwargs)
+            finally:
+                if vision_token is not None:
+                    reset_cp_vision_group(vision_token)
         # AutoModel's custom MoE/LLM models (e.g. Qwen3MoeForCausalLM) return a
         # raw logits Tensor; HF returns a ModelOutput with `.logits`. Normalize.
         output = _normalize_output(output)

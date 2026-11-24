@@ -293,7 +293,9 @@ class FsdpStrategy:
         # Grad accumulation is DP-only; CP ranks share samples and split sequence work.
         dp_size = self._get_dp_group_size(include_cp=False)
         self.dp_cp_size = self._get_dp_group_size(include_cp=True)
-        if getattr(getattr(self.args, "train", None), "dynamic_batch_enable", False):
+        if getattr(getattr(self.args, "train", None), "dynamic_batch_enable", False) or getattr(
+            getattr(self.args, "train", None), "force_on_policy", False
+        ):
             self.accumulated_gradient = 1
         else:
             batch_per_step = self.micro_train_batch_size * dp_size

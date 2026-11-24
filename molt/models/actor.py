@@ -16,12 +16,19 @@
 # Adapted from OpenRLHF (https://github.com/OpenRLHF/OpenRLHF),
 # Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
 
+import os
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from molt.models.chunked_head import (
+    _chunked_head_consumer,
+    can_use_chunked_head,
+    chunked_head_log_probs,
+    ensure_chunked_head_hook,
+)
 from molt.trainer.fsdp.packing import log_probs_from_vocab_parallel_logits, unshard_dtensor
 
 from .base import BaseModel, _AttrDict
@@ -62,9 +69,18 @@ class Actor(BaseModel):
                                 — only when given (score centering).
         - ``aux_loss``:         MoE load-balancing loss — only for NeMo custom MoE.
         """
-        output, rolled_sequences, cp_forward, indices, batch, seqlen = self._forward_backbone(
-            sequences, attention_mask, position_ids, cp_context_stack, mm_inputs, routed_experts=routed_experts
-        )
+        use_chunked_head = can_use_chunked_head(self.model, return_entropy=return_entropy)
+        head_token = None
+        if use_chunked_head:
+            ensure_chunked_head_hook(self.model.lm_head)
+            head_token = _chunked_head_consumer.set(self.model.lm_head)
+        try:
+            output, rolled_sequences, cp_forward, indices, batch, seqlen = self._forward_backbone(
+                sequences, attention_mask, position_ids, cp_context_stack, mm_inputs, routed_experts=routed_experts
+            )
+        finally:
+            if head_token is not None:
+                _chunked_head_consumer.reset(head_token)
         logits = output["logits"]
         full_logits = None
 
@@ -112,7 +128,40 @@ class Actor(BaseModel):
                 ids = ids.reshape(-1, ids.shape[-1]).index_select(0, indices).unsqueeze(0)
                 ids = F.pad(ids, (0, 0, 0, rolled_sequences.shape[1] - ids.shape[1]))
             targets = torch.cat([rolled_sequences.unsqueeze(-1), ids.reshape(*rolled_sequences.shape, -1)], dim=-1)
-        if isinstance(logits, DTensor):
+        if use_chunked_head:
+            local_active_mask = None
+            if (
+                action_mask is not None
+                and os.environ.get("MOLT_LM_HEAD_ACTIVE_ONLY", "1") == "1"
+                and action_mask.shape[1] <= seqlen - 1
+            ):
+                pad_left = seqlen - 1 - action_mask.shape[1]
+                active = F.pad(action_mask.bool(), (pad_left, 1), value=False)
+                if cp_forward:
+                    if self.packing_samples:
+                        active = F.pad(active, (0, -active.shape[1] % (2 * self.cp_size)), value=False)
+                        local_active_mask = self._cp_sharder.shard_token_tensor(active, fill=0).bool()
+                    else:
+                        layout = getattr(self._cp_sharder, "shard_layout", None)
+                        target_len = getattr(layout, "padded_seq_len", None)
+                        if target_len is not None and active.shape[1] < target_len:
+                            active = F.pad(active, (0, target_len - active.shape[1]), value=False)
+                        local_active_mask = self._cp_sharder.shard_token_tensor(active, seq_dim=1, fill=0).bool()
+                elif indices is not None:
+                    active_packed = active.reshape(-1).index_select(0, indices).unsqueeze(0)
+                    local_active_mask = F.pad(
+                        active_packed, (0, rolled_sequences.shape[1] - active_packed.shape[1]), value=False
+                    )
+                else:
+                    local_active_mask = active
+            all_log_probs = chunked_head_log_probs(
+                logits,
+                self.model.lm_head,
+                targets,
+                temperature=self.temperature,
+                active_mask=local_active_mask,
+            )
+        elif isinstance(logits, DTensor):
             all_log_probs = log_probs_from_vocab_parallel_logits(logits, targets, temperature=self.temperature)
         else:
             # Pass bf16 directly: log_probs_from_logits chunks the fp32 upcast
