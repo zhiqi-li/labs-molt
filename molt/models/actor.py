@@ -116,10 +116,14 @@ class Actor(BaseModel):
                 raise NotImplementedError("top-k log-probs (score centering) need fsdp.tp_size == 1")
             ids = F.pad(top_ids, (0, 0, 0, 1))
             if cp_forward:
-                # Same verb as the R3 routing ids: THD layouts shard the flattened [B*S] stream
-                # (token axes leading) after _forward_backbone padded it to a multiple of 2 * cp_size,
-                # so the ids get the same tail; padded layouts shard the seq dim (the sharder pads).
-                if self.packing_samples:
+                if indices is not None and getattr(self, "is_vlm", False):
+                    ids = ids.reshape(-1, ids.shape[-1]).index_select(0, indices).unsqueeze(0)
+                    layout = getattr(self._cp_sharder, "shard_layout", None)
+                    target_len = getattr(layout, "padded_seq_len", None)
+                    if target_len is not None and ids.shape[1] < target_len:
+                        ids = F.pad(ids, (0, 0, 0, target_len - ids.shape[1]))
+                    ids = self._cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0)
+                elif self.packing_samples and not getattr(self, "is_vlm", False):
                     ids = F.pad(ids, (0, 0, 0, -ids.shape[1] % (2 * self.cp_size)))
                     ids = self._cp_sharder.shard_token_tensor(ids, fill=0)
                 else:
@@ -142,7 +146,14 @@ class Actor(BaseModel):
                 pad_left = seqlen - 1 - action_mask.shape[1]
                 active = F.pad(action_mask.bool(), (pad_left, 1), value=False)
                 if cp_forward:
-                    if self.packing_samples:
+                    if indices is not None and getattr(self, "is_vlm", False):
+                        active_packed = active.reshape(-1).index_select(0, indices).unsqueeze(0)
+                        layout = getattr(self._cp_sharder, "shard_layout", None)
+                        target_len = getattr(layout, "padded_seq_len", None)
+                        if target_len is not None and active_packed.shape[1] < target_len:
+                            active_packed = F.pad(active_packed, (0, target_len - active_packed.shape[1]), value=False)
+                        local_active_mask = self._cp_sharder.shard_token_tensor(active_packed, seq_dim=1, fill=0).bool()
+                    elif self.packing_samples and not getattr(self, "is_vlm", False):
                         active = F.pad(active, (0, -active.shape[1] % (2 * self.cp_size)), value=False)
                         local_active_mask = self._cp_sharder.shard_token_tensor(active, fill=0).bool()
                     else:

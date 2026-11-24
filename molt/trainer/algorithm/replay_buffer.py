@@ -16,7 +16,7 @@
 # Adapted from OpenRLHF (https://github.com/OpenRLHF/OpenRLHF),
 # Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
 
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch import distributed as dist
@@ -29,6 +29,76 @@ from molt.trainer.algorithm.experience import (
     split_experience_batch,
 )
 from molt.utils.seqlen_balancing import get_minimum_num_micro_batch_size, get_seqlen_balanced_partitions
+
+
+def _experience_media_keys(item: Experience) -> tuple[str, ...]:
+    """Return sorted multimodal input keys for DP collective alignment (works with or without #23's media_keys)."""
+    keys = getattr(item, "media_keys", None)
+    if keys is not None:
+        return tuple(keys)
+    return tuple(
+        sorted(
+            {
+                key
+                for entry in (item.mm_train_inputs or [])
+                for inputs in (entry if isinstance(entry, list) else [entry])
+                for key in (inputs or ())
+            }
+        )
+    )
+
+
+def _bounded_ffd_bins(
+    indices: List[int],
+    sample_lengths: List[int],
+    max_tokens: int,
+) -> List[List[int]]:
+    """First-Fit Decreasing bin packing with a strict token cap on multi-sample bins.
+
+    Any single sequence longer than ``max_tokens`` stays in a solo bin of size 1 so
+    packing never raises peak sequence length above the single-sample maximum.
+    """
+    ordered = sorted(indices, key=lambda idx: sample_lengths[idx], reverse=True)
+    bins: List[List[int]] = []
+    sums: List[int] = []
+    for idx in ordered:
+        length = sample_lengths[idx]
+        placed = False
+        for b_idx in range(len(bins)):
+            if sums[b_idx] + length <= max_tokens:
+                bins[b_idx].append(idx)
+                sums[b_idx] += length
+                placed = True
+                break
+        if not placed:
+            bins.append([idx])
+            sums.append(length)
+    return bins
+
+
+def _expand_bins_to_count(
+    bins: List[List[int]],
+    sample_lengths: List[int],
+    target_count: int,
+) -> List[List[int]]:
+    """Split multi-sample bins until ``len(bins) == target_count`` while preserving the token cap."""
+    bins = [list(b) for b in bins]
+    sums = [sum(sample_lengths[idx] for idx in b) for b in bins]
+    while len(bins) < target_count:
+        splittable = [i for i, b in enumerate(bins) if len(b) > 1]
+        if not splittable:
+            raise RuntimeError(
+                f"Cannot expand {len(bins)} packed microbatches to {target_count} across DP ranks "
+                f"(only {sum(len(b) for b in bins)} samples in media group)."
+            )
+        pick = max(splittable, key=lambda i: (sums[i], len(bins[i])))
+        moved = bins[pick].pop()
+        moved_len = sample_lengths[moved]
+        sums[pick] -= moved_len
+        bins.append([moved])
+        sums.append(moved_len)
+    order = sorted(range(len(bins)), key=lambda i: sums[i], reverse=True)
+    return [bins[i] for i in order]
 
 
 class NaiveReplayBuffer:
@@ -96,7 +166,7 @@ class NaiveReplayBuffer:
 
     def setup_dynamic_batch(self, strategy):
         args = strategy.args
-        sample_lengths = [sample.total_length.item() for sample in self.items]
+        sample_lengths = [int(sample.total_length.item()) for sample in self.items]
 
         world_size = dist.get_world_size()
         dp_size = world_size // get_model_parallel_size(args)
@@ -136,24 +206,35 @@ class NaiveReplayBuffer:
         # Group each optimizer step's samples by media_keys (text first, media last) so
         # every DP rank executes the same media type on each microbatch and deferred
         # gradient sync still includes the vision tower on the last microbatch.
-        step_groups: List[List[List[int]]] = []
+        # Non-empty media groups use bounded FFD packing (never pairing sequences beyond
+        # max_tokens while keeping oversized solo sequences untouched); text-only groups
+        # keep Karmarkar-Karp balanced partitioning.
+        max_tokens = int(args.train.max_tokens_per_gpu) * int(args.fsdp.cp_size) * int(args.fsdp.tp_size)
+        step_groups: List[List[tuple[tuple[str, ...], List[int]]]] = []
+        local_bins_per_group: List[Optional[List[List[int]]]] = []
         num_microbatches = []
         for i in range(num_steps):
             start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
-            by_media = {}
+            by_media: dict[tuple[str, ...], List[int]] = {}
             for idx in range(start, end):
-                by_media.setdefault(self.items[idx].media_keys, []).append(idx)
-            groups = [by_media[media] for media in sorted(by_media)]
+                by_media.setdefault(_experience_media_keys(self.items[idx]), []).append(idx)
+            groups = [(media, by_media[media]) for media in sorted(by_media)]
             step_groups.append(groups)
-            for group in groups:
-                num_microbatches.append(
-                    get_minimum_num_micro_batch_size(
-                        [sample_lengths[idx] for idx in group],
-                        args.train.max_tokens_per_gpu,
-                        args.fsdp.cp_size,
-                        args.fsdp.tp_size,
+            for media, group in groups:
+                if media:
+                    bins = _bounded_ffd_bins(group, sample_lengths, max_tokens)
+                    local_bins_per_group.append(bins)
+                    num_microbatches.append(len(bins))
+                else:
+                    local_bins_per_group.append(None)
+                    num_microbatches.append(
+                        get_minimum_num_micro_batch_size(
+                            [sample_lengths[idx] for idx in group],
+                            args.train.max_tokens_per_gpu,
+                            args.fsdp.cp_size,
+                            args.fsdp.tp_size,
+                        )
                     )
-                )
 
         num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
         num_microbatches = strategy.all_reduce(num_microbatches, op="max")
@@ -162,15 +243,18 @@ class NaiveReplayBuffer:
         # Partition each (step, media) group independently into the synced microbatch count.
         micro_batch_indices = []
         data_partitions = []
-        mb_iter = iter(num_microbatches)
+        mb_iter = iter(zip(num_microbatches, local_bins_per_group))
         for groups in step_groups:
             step_partitions = []
-            for group in groups:
-                num_mbs = next(mb_iter)
-                partitions = get_seqlen_balanced_partitions(
-                    [sample_lengths[idx] for idx in group], num_mbs, equal_size=False
-                )
-                step_partitions.extend([[group[k] for k in partition] for partition in partitions])
+            for _media, group in groups:
+                num_mbs, local_bins = next(mb_iter)
+                if local_bins is not None:
+                    step_partitions.extend(_expand_bins_to_count(local_bins, sample_lengths, num_mbs))
+                else:
+                    partitions = get_seqlen_balanced_partitions(
+                        [sample_lengths[idx] for idx in group], num_mbs, equal_size=False
+                    )
+                    step_partitions.extend([[group[k] for k in partition] for partition in partitions])
             micro_batch_indices.extend(step_partitions)
             data_partitions.append(step_partitions)
         self.dynamic_indices = micro_batch_indices
