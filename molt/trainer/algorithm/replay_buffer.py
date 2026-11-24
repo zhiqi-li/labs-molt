@@ -31,6 +31,76 @@ from molt.trainer.algorithm.experience import (
 from molt.utils.seqlen_balancing import get_minimum_num_micro_batch_size, get_seqlen_balanced_partitions
 
 
+def _experience_media_keys(item: Experience) -> tuple[str, ...]:
+    """Return sorted multimodal input keys for DP collective alignment (works with or without #23's media_keys)."""
+    keys = getattr(item, "media_keys", None)
+    if keys is not None:
+        return tuple(keys)
+    return tuple(
+        sorted(
+            {
+                key
+                for entry in (item.mm_train_inputs or [])
+                for inputs in (entry if isinstance(entry, list) else [entry])
+                for key in (inputs or ())
+            }
+        )
+    )
+
+
+def _bounded_ffd_bins(
+    indices: List[int],
+    sample_lengths: List[int],
+    max_tokens: int,
+) -> List[List[int]]:
+    """First-Fit Decreasing bin packing with a strict token cap on multi-sample bins.
+
+    Any single sequence longer than ``max_tokens`` stays in a solo bin of size 1 so
+    packing never raises peak sequence length above the single-sample maximum.
+    """
+    ordered = sorted(indices, key=lambda idx: sample_lengths[idx], reverse=True)
+    bins: List[List[int]] = []
+    sums: List[int] = []
+    for idx in ordered:
+        length = sample_lengths[idx]
+        placed = False
+        for b_idx in range(len(bins)):
+            if sums[b_idx] + length <= max_tokens:
+                bins[b_idx].append(idx)
+                sums[b_idx] += length
+                placed = True
+                break
+        if not placed:
+            bins.append([idx])
+            sums.append(length)
+    return bins
+
+
+def _expand_bins_to_count(
+    bins: List[List[int]],
+    sample_lengths: List[int],
+    target_count: int,
+) -> List[List[int]]:
+    """Split multi-sample bins until ``len(bins) == target_count`` while preserving the token cap."""
+    bins = [list(b) for b in bins]
+    sums = [sum(sample_lengths[idx] for idx in b) for b in bins]
+    while len(bins) < target_count:
+        splittable = [i for i, b in enumerate(bins) if len(b) > 1]
+        if not splittable:
+            raise RuntimeError(
+                f"Cannot expand {len(bins)} packed microbatches to {target_count} across DP ranks "
+                f"(only {sum(len(b) for b in bins)} samples in media group)."
+            )
+        pick = max(splittable, key=lambda i: (sums[i], len(bins[i])))
+        moved = bins[pick].pop()
+        moved_len = sample_lengths[moved]
+        sums[pick] -= moved_len
+        bins.append([moved])
+        sums.append(moved_len)
+    order = sorted(range(len(bins)), key=lambda i: sums[i], reverse=True)
+    return [bins[i] for i in order]
+
+
 class NaiveReplayBuffer:
     """Stores rollout experiences and yields training microbatches via the Dataset protocol.
 
@@ -92,7 +162,7 @@ class NaiveReplayBuffer:
 
     def setup_dynamic_batch(self, strategy):
         args = strategy.args
-        sample_lengths = [sample.total_length.item() for sample in self.items]
+        sample_lengths = [int(sample.total_length.item()) for sample in self.items]
 
         world_size = dist.get_world_size()
         dp_size = world_size // get_model_parallel_size(args)
@@ -121,35 +191,56 @@ class NaiveReplayBuffer:
                     f"{local_train_batch_size}-sample train batch (buffer={len(sample_lengths)})."
                 )
 
-        # split by train_batch_size, sync num_microbatches across dp
-        num_microbatches = []
-        for i in range(num_steps):
-            start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
-            num_microbatches.append(
-                get_minimum_num_micro_batch_size(
-                    sample_lengths[start:end],
-                    args.train.max_tokens_per_gpu,
-                    args.fsdp.cp_size,
-                    args.fsdp.tp_size,
+        max_tokens = int(args.train.max_tokens_per_gpu) * int(args.fsdp.cp_size) * int(args.fsdp.tp_size)
+        has_media = strategy.all_reduce(
+            1.0 if any(bool(_experience_media_keys(item)) for item in self.items) else 0.0, op="max"
+        ) > 0.0
+
+        if has_media:
+            micro_batch_indices = []
+            data_partitions = []
+            for i in range(num_steps):
+                start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
+                by_media: dict[tuple[str, ...], List[int]] = {}
+                for idx in range(start, end):
+                    by_media.setdefault(_experience_media_keys(self.items[idx]), []).append(idx)
+                step_bins: List[List[int]] = []
+                for media in sorted(by_media):
+                    local_bins = _bounded_ffd_bins(by_media[media], sample_lengths, max_tokens)
+                    target_mbs = int(round(strategy.all_reduce(float(len(local_bins)), op="max")))
+                    step_bins.extend(_expand_bins_to_count(local_bins, sample_lengths, target_mbs))
+                micro_batch_indices.extend(step_bins)
+                data_partitions.append(step_bins)
+        else:
+            # split by train_batch_size, sync num_microbatches across dp
+            num_microbatches = []
+            for i in range(num_steps):
+                start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
+                num_microbatches.append(
+                    get_minimum_num_micro_batch_size(
+                        sample_lengths[start:end],
+                        args.train.max_tokens_per_gpu,
+                        args.fsdp.cp_size,
+                        args.fsdp.tp_size,
+                    )
                 )
-            )
 
-        num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
-        num_microbatches = strategy.all_reduce(num_microbatches, op="max")
-        num_microbatches = num_microbatches.tolist()
+            num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
+            num_microbatches = strategy.all_reduce(num_microbatches, op="max")
+            num_microbatches = num_microbatches.tolist()
 
-        # balance the number of microbatches across steps
-        micro_batch_indices = []
-        data_partitions = []
-        for i, num_mbs in enumerate(num_microbatches):
-            start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
-            samples = sample_lengths[start:end]
-            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)  # List[List[int]], index
-            for j in range(num_mbs):
-                for k in range(len(partitions[j])):
-                    partitions[j][k] += start
-            micro_batch_indices.extend(partitions)
-            data_partitions.append(partitions)
+            # balance the number of microbatches across steps
+            micro_batch_indices = []
+            data_partitions = []
+            for i, num_mbs in enumerate(num_microbatches):
+                start, end = i * local_train_batch_size, (i + 1) * local_train_batch_size
+                samples = sample_lengths[start:end]
+                partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)  # List[List[int]], index
+                for j in range(num_mbs):
+                    for k in range(len(partitions[j])):
+                        partitions[j][k] += start
+                micro_batch_indices.extend(partitions)
+                data_partitions.append(partitions)
         self.dynamic_indices = micro_batch_indices
         self.sample_batch_size = 1
 

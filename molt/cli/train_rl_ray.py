@@ -1203,8 +1203,11 @@ if __name__ == "__main__":
         )
 
     # --- Data ---
-    if args.data.max_images_per_prompt > 0 and args.fsdp.packing_samples:
-        print("[Warning] VLM training does not support --fsdp.packing_samples; disabling packing for this run.")
+    if args.data.max_images_per_prompt > 0 and args.fsdp.packing_samples and args.fsdp.cp_size <= 1:
+        print(
+            "[Warning] VLM --fsdp.packing_samples currently requires --fsdp.cp_size > 1 "
+            "(block-diagonal CP); disabling packing for this run."
+        )
         args.fsdp.packing_samples = False
 
     # --- Parallelism / FSDP ---
@@ -1262,10 +1265,12 @@ if __name__ == "__main__":
 
     if args.fsdp.packing_samples:
         assert args.vllm.num_engines > 0, "Only support `--fsdp.packing_samples` with vLLM."
-        # tilelang joins te/fa2: DSA (glm_moe_dsa) is THD-native and *requires* packing.
-        if args.fsdp.attn_implementation not in {"te", "flash_attention_2", "tilelang"}:
+        allowed_attn = {"te", "flash_attention_2", "tilelang"}
+        if args.data.max_images_per_prompt > 0 and args.fsdp.cp_size > 1:
+            allowed_attn.add("sdpa")
+        if args.fsdp.attn_implementation not in allowed_attn:
             raise ValueError(
-                "--fsdp.packing_samples requires --fsdp.attn_implementation te, flash_attention_2, or tilelang."
+                f"--fsdp.packing_samples requires --fsdp.attn_implementation in {sorted(allowed_attn)}."
             )
 
     # --- Training / rollout sizing ---
