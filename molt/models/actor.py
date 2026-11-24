@@ -107,6 +107,10 @@ class Actor(BaseModel):
                     ids = F.pad(ids, (0, 0, 0, -ids.shape[1] % (2 * self.cp_size)))
                     ids = self._cp_sharder.shard_token_tensor(ids, fill=0)
                 else:
+                    layout = getattr(self._cp_sharder, "shard_layout", None)
+                    target_len = getattr(layout, "padded_seq_len", None)
+                    if target_len is not None and ids.shape[1] < target_len:
+                        ids = F.pad(ids, (0, 0, 0, target_len - ids.shape[1]))
                     ids = self._cp_sharder.shard_token_tensor(ids, seq_dim=1, fill=0)
             elif indices is not None:  # packed forward: same real-token order (and pad) as the labels
                 ids = ids.reshape(-1, ids.shape[-1]).index_select(0, indices).unsqueeze(0)
