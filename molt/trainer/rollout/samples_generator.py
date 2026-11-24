@@ -254,6 +254,17 @@ class WarmRolloutWriter:
             return None
 
 
+def _canonical_warm_recipe(recipe: Any) -> Any:
+    """Drop trainer-side batching knobs (e.g. rollout.max_tokens_per_gpu) that never affect rollout generation."""
+    if not isinstance(recipe, dict):
+        return recipe
+    out = dict(recipe)
+    rollout = out.get("rollout")
+    if isinstance(rollout, dict) and "max_tokens_per_gpu" in rollout:
+        out["rollout"] = {k: v for k, v in rollout.items() if k != "max_tokens_per_gpu"}
+    return out
+
+
 def load_warm_rollout(
     ckpt_path: str,
     *,
@@ -280,7 +291,7 @@ def load_warm_rollout(
         if manifest.get("source_episode") != episode or manifest.get("source_consumed_prompts") != consumed_prompts:
             logger.warning(f"[warm_resume] ignoring {manifest_path}: cursor mismatch")
             return None
-        if manifest.get("recipe") != recipe:
+        if _canonical_warm_recipe(manifest.get("recipe")) != _canonical_warm_recipe(recipe):
             logger.warning(f"[warm_resume] ignoring {manifest_path}: recipe differs from current run")
             return None
         group_files = list(manifest.get("group_files") or [])
