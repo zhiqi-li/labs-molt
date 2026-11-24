@@ -86,8 +86,14 @@ def _validate_attn_implementation(attn_implementation: str) -> None:
         raise ValueError("--fsdp.attn_implementation te requires transformer-engine to be installed.")
 
 
-def _resolve_custom_backend_attn(attn_implementation: str, packing_samples: bool) -> str:
+def _resolve_custom_backend_attn(
+    attn_implementation: str, packing_samples: bool, *, is_vlm: bool = False, cp_size: int = 1
+) -> str:
     if packing_samples:
+        if is_vlm and cp_size > 1:
+            # Qwen3.5 VLM block-diagonal CP packing requires AutoModel's sdpa backend
+            # (which routes through blockdiag_cp FlashAttention varlen kernels).
+            return "sdpa"
         if attn_implementation == "te":
             return "te"
         if attn_implementation == "tilelang":
@@ -397,7 +403,9 @@ class BaseModel(nn.Module):
         if not use_hf_model:
             from nemo_automodel.components.models.common.utils import BackendConfig
 
-            backend_attn = _resolve_custom_backend_attn(attn_implementation, packing_samples)
+            backend_attn = _resolve_custom_backend_attn(
+                attn_implementation, packing_samples, is_vlm=self.is_vlm, cp_size=self.cp_size
+            )
             using_te = backend_attn == "te"
             # Disable TE fused RoPE everywhere: VLM mRoPE position tensors don't match
             # the simpler 4D rotary layout the fused kernel expects (first surfaced under
@@ -458,7 +466,7 @@ class BaseModel(nn.Module):
             attn_implementation=attn_for_from_pretrained,
             distributed_setup=dist_setup,
             use_liger_kernel=False,
-            has_packed_sequence=packing_samples,
+            has_packed_sequence=packing_samples and not (self.is_vlm and self.cp_size > 1),
             force_hf=False,
             freeze_config={"freeze_vision_tower": True} if freeze_visual_encoder else None,
             peft_config=self.peft_config,
@@ -563,7 +571,11 @@ class BaseModel(nn.Module):
             # [B, seqlen] coordinates via the sharder layout (narrow for round_robin,
             # reshape for THD input_row_shape). The trailing slice drops the
             # cp-multiple pad the forward added.
-            return self._cp_sharder.gather_token_tensor(t, seq_dim=1, trim=True, fill=0.0)[:, :seqlen]
+            full = self._cp_sharder.gather_token_tensor(t, seq_dim=1, trim=True, fill=0.0)
+            if indices is not None:
+                packed_len = getattr(self, "_vlm_packed_len", int(indices.numel()))
+                return unpack_to_padded(full[:, :packed_len], indices, batch, seqlen)
+            return full[:, :seqlen]
         if self.packing_samples:
             # cp1 packing: scatter the packed [1, total] rows back to padded [B, seqlen].
             return unpack_to_padded(t, indices, batch, seqlen)
@@ -638,6 +650,7 @@ class BaseModel(nn.Module):
         cp_ctx_factory = nullcontext
         cp_batch = None  # built in the packed or padded branch below; None => no CP sharding
         self._cp_sharder = None  # set below under CP; read by _restore_full_sequence / _build_routing_targets
+        self._vlm_packed_len = None
         if self.packing_samples and self.cp_size == 1:
             # cp1 real-token packing. CP is incompatible with packed sequences: cp>1
             # falls through to the padded branch, where the model-owned sharder
@@ -652,6 +665,51 @@ class BaseModel(nn.Module):
                 sequences, attention_mask, style=self._packing_style, pad_to_tokens=pad_to_tokens
             )
             forward_attention_mask = None
+        elif (
+            self.packing_samples
+            and self.cp_size > 1
+            and getattr(self, "is_vlm", False)
+            and attention_mask is not None
+            and batch > 1
+        ):
+            from molt.models.vlm_packing import pack_vlm_batch_for_cp
+
+            if not hasattr(self.model, "prepare_model_inputs_for_cp"):
+                raise RuntimeError(
+                    "VLM packed CP requires AutoModel's prepare_model_inputs_for_cp hook."
+                )
+            align_env = os.environ.get("MOLT_SEQ_ALIGN", "1")
+            align_mult = 2 * self.cp_size if align_env == "0" else (16 * self.cp_size if align_env == "1" else int(align_env))
+            if align_mult % (2 * self.cp_size) != 0:
+                align_mult = ((align_mult + 2 * self.cp_size - 1) // (2 * self.cp_size)) * (2 * self.cp_size)
+            pad_id = getattr(getattr(self.model, "config", None), "pad_token_id", None) or 0
+            (
+                packed_ids,
+                rolled_sequences,
+                packed_pos_ids,
+                packed_seq_ids,
+                indices,
+                packed_len,
+            ) = pack_vlm_batch_for_cp(
+                self.model,
+                sequences,
+                attention_mask,
+                mm_inputs,
+                image_token_id=self._image_token_id,
+                video_token_id=self._video_token_id,
+                pad_token_id=pad_id,
+                align_multiple=align_mult,
+            )
+            self._vlm_packed_len = packed_len
+            forward_attention_mask = None
+            clean_mm = {k: v for k, v in mm_inputs.items() if k not in ("mm_token_type_ids", "token_type_ids")}
+            cp_batch = {
+                "input_ids": packed_ids,
+                "labels": rolled_sequences,
+                "position_ids": packed_pos_ids,
+                "_packed_seq_ids": packed_seq_ids,
+                **clean_mm,
+            }
         else:
             # THD CP flattens the batch to one token stream and TE asserts it divides by
             # 2 * cp_size (each rank takes two chunks for load balance), so pad before anything
@@ -669,6 +727,26 @@ class BaseModel(nn.Module):
                     if routed_experts is not None:
                         # -1 = "no captured routing", so RouterReplay keeps the live choice
                         routed_experts = F.pad(routed_experts, (0, pad), value=-1)
+
+            if self.cp_size > 1 and attention_mask is not None and not self.packing_samples:
+                # Align sequence length to a multiple of 16 * cp_size (default) so each CP rank's
+                # local length is divisible by 16 (avoids Triton dual divisible/non-divisible
+                # kernel specializations). Causal attention/GDN never reads trailing pad tokens,
+                # and _restore_full_sequence trims back to original seqlen.
+                align_env = os.environ.get("MOLT_SEQ_ALIGN", "1")
+                if align_env != "0":
+                    align_mult = 16 * self.cp_size if align_env == "1" else int(align_env)
+                    if align_mult > 1 and align_mult % (2 * self.cp_size) != 0:
+                        align_mult = ((align_mult + 2 * self.cp_size - 1) // (2 * self.cp_size)) * (2 * self.cp_size)
+                    pad = -seqlen % align_mult if align_mult > 1 else 0
+                    if pad:
+                        pad_id = getattr(getattr(self.model, "config", None), "pad_token_id", None) or 0
+                        sequences = F.pad(sequences, (0, pad), value=pad_id)
+                        attention_mask = F.pad(attention_mask, (0, pad), value=0)
+                        if position_ids is not None:
+                            position_ids = F.pad(position_ids, (0, pad), value=0)
+                        if routed_experts is not None:
+                            routed_experts = F.pad(routed_experts, (0, pad), value=-1)
 
             # https://github.com/OpenRLHF/OpenRLHF/issues/217
             rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
@@ -829,8 +907,33 @@ class BaseModel(nn.Module):
             )
             if output_hidden_states:
                 forward_kwargs["output_hidden_states"] = True
-            with replay_ctx:
-                output = self.model(**forward_kwargs)
+            vision_token = None
+            if (
+                cp_forward
+                and getattr(self, "is_vlm", False)
+                and self.cp_size > 1
+                and os.environ.get("MOLT_CP_VISION_SHARD", "1") == "1"
+            ):
+                try:
+                    from nemo_automodel.components.distributed.cp_vision_frame_shard import (
+                        CpVisionFrameShardingConfig,
+                        reset_cp_vision_group,
+                        set_cp_vision_group,
+                    )
+
+                    vision_token = set_cp_vision_group(
+                        self.device_mesh["cp"].get_group(),
+                        config=CpVisionFrameShardingConfig(enabled=True),
+                        spans_only_cp=True,
+                    )
+                except ImportError:
+                    vision_token = None
+            try:
+                with replay_ctx:
+                    output = self.model(**forward_kwargs)
+            finally:
+                if vision_token is not None:
+                    reset_cp_vision_group(vision_token)
         # AutoModel's custom MoE/LLM models (e.g. Qwen3MoeForCausalLM) return a
         # raw logits Tensor; HF returns a ModelOutput with `.logits`. Normalize.
         output = _normalize_output(output)
