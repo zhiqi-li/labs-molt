@@ -277,6 +277,10 @@ class RolloutRayActor:
         kwargs = {name: True for name in ("reset_running_requests", "reset_connector") if name in supported}
         if await self.llm.reset_prefix_cache(**kwargs) is False:
             print("[refit] WARNING: vLLM refused to reset the prefix cache; rollout may reuse stale KV", flush=True)
+        # Clear GPU vision-encoder embedding cache so updated vision weights take effect immediately
+        # (while keeping weight-independent preprocessed pixel_values in mm_processor_cache intact).
+        if hasattr(self.llm, "reset_encoder_cache"):
+            await self.llm.reset_encoder_cache()
 
 
 def create_vllm_engines(
@@ -446,13 +450,13 @@ def create_vllm_engines(
 
         if max_images_per_prompt > 0:
             actor_kwargs["limit_mm_per_prompt"] = {"image": max_images_per_prompt}
-            # Disable vLLM's mm preprocessor cache for VLM rollouts. The cache
-            # keys image features by content hash; after each weight broadcast
-            # cached entries become stale and the engine asserts on cache-miss
-            # (`mm_receiver_cache.get_and_update_item -> Expected a cached item`).
-            # Cost is recomputing image features per request — fine since the
-            # vision encoder is frozen and cheap relative to LM forward.
-            actor_kwargs["mm_processor_cache_gb"] = 0
+            # Default 0 preserves stock behavior; setting MOLT_VLLM_MM_CACHE_GB>0 (e.g. 8) enables
+            # vLLM's LRU mm_processor_cache so RouterGenerateClient can elide already-sent image
+            # pixel_values (kwargs_data[i]=None) on multi-turn VLM rollouts (~130x smaller payloads).
+            mm_cache_gb = float(os.environ.get("MOLT_VLLM_MM_CACHE_GB", "0") or 0)
+            actor_kwargs["mm_processor_cache_gb"] = mm_cache_gb
+            if mm_cache_gb > 0:
+                actor_kwargs["mm_processor_cache_type"] = os.environ.get("MOLT_VLLM_MM_CACHE_TYPE", "lru")
 
         # Pass-through only when the caller (or CLI) chose an explicit value, so
         # vLLM's own None→auto resolution (see config/vllm.py:844 for async,

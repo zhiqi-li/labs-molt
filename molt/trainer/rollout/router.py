@@ -30,7 +30,9 @@ trainer round-robins prompts across a list of them (``--rollout.num_runners``).
 
 import asyncio
 import base64
+import hashlib
 import io
+import json
 import os
 import socket
 import time
@@ -182,7 +184,8 @@ def _inference_sampling_params(sp) -> dict:
 def _image_data_uri(image) -> str:
     """PIL image -> a ``data:`` URI for the render endpoint's ``image_url`` content."""
     buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
+    # compress_level=1 is 100% lossless (identical RGB pixels) and ~4-5x faster than default zlib level 6.
+    image.convert("RGB").save(buf, format="PNG", compress_level=1)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
@@ -218,8 +221,14 @@ def _align_features_to_canonical(features: dict, canonical: list, image_token_id
 
 def _image_items(features: dict, count: int):
     """(kwargs_data items, mm_hashes items) of an image-only render of ``count`` images, else None."""
-    keys = {"mm_placeholders", "kwargs_data", "mm_hashes"}
-    if set(features) != keys or any(not isinstance(features[k], dict) or set(features[k]) != {"image"} for k in keys):
+    required = {"mm_placeholders", "kwargs_data", "mm_hashes"}
+    allowed = required | {"mm_metadata"}
+    if not required.issubset(features) or not set(features).issubset(allowed):
+        return None
+    if any(not isinstance(features[k], dict) or set(features[k]) != {"image"} for k in required):
+        return None
+    meta = features.get("mm_metadata")
+    if meta is not None and (not isinstance(meta, dict) or set(meta) != {"image"}):
         return None
     kwargs, hashes = features["kwargs_data"]["image"], features["mm_hashes"]["image"]
     if not isinstance(kwargs, list) or not isinstance(hashes, list) or len(kwargs) != count or len(hashes) != count:
@@ -245,14 +254,39 @@ class RouterGenerateClient:
     # image processor's per-image budget is independent of the image count below ~512 images; checked bitwise on
     # the M2 processor), so a turn renders only its new images and reuses the earlier items. mm_placeholders are
     # rebuilt by _align_features_to_canonical anyway. Off by default; the engine-side mm cache stays off.
-    RENDER_CACHE_SESSIONS = 64
+    RENDER_CACHE_SESSIONS = 128
 
-    def __init__(self, http_client, *, model_name="policy", image_token_id=None):
+    def __init__(self, http_client, *, model_name="policy", image_token_id=None, engine_urls=None):
         self.http = http_client
         self.model_name = model_name
         self.image_token_id = image_token_id  # HF processor's image placeholder id (VLM realign)
+        self._engine_urls = [str(u).rstrip("/") for u in engine_urls] if engine_urls else None
         self._render_cache_on = os.environ.get("MOLT_RENDER_CACHE") == "1"
         self._render_cache = OrderedDict()  # session id -> (images, kwargs_data items, mm_hashes items), LRU
+        self._delta_mm_on = self._render_cache_on and float(os.environ.get("MOLT_VLLM_MM_CACHE_GB", "0") or 0) > 0
+        self._sent_mm_hashes = OrderedDict()  # session id -> (target_base, set[mm_hash]), LRU
+
+    def _engine_for(self, session_id: str | None) -> str | None:
+        if not self._engine_urls:
+            return None
+        key = (session_id or "").encode("utf-8")
+        idx = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "little") % len(self._engine_urls)
+        return self._engine_urls[idx]
+
+    def _target_url(self, path: str, session_id: str | None) -> str:
+        base = self._engine_for(session_id)
+        return f"{base}{path}" if base else path
+
+    def _sent_hashes_for(self, session_id: str, target_base: str) -> set[str]:
+        entry = self._sent_mm_hashes.pop(session_id, None)
+        if entry is not None and entry[0] == target_base:
+            hashes = entry[1]
+        else:
+            hashes = set()
+        self._sent_mm_hashes[session_id] = (target_base, hashes)
+        while len(self._sent_mm_hashes) > self.RENDER_CACHE_SESSIONS:
+            self._sent_mm_hashes.popitem(last=False)
+        return hashes
 
     async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None, session_id=None):
         prompt = list(prompt_token_ids)
@@ -267,7 +301,7 @@ class RouterGenerateClient:
             _align_features_to_canonical(features, prompt, self.image_token_id)
         return await self._generate_inference(prompt, sampling_params, features, sid)
 
-    async def _post(self, path, payload, session_id):
+    async def _post(self, path, payload, session_id, *, max_attempts: int = 20):
         """POST to a router route (``model`` + the routing-affinity header injected), return parsed JSON.
 
         Tries a transient failure 20 times, a second apart — a 5xx or a refused/dropped connection while
@@ -275,16 +309,28 @@ class RouterGenerateClient:
         checks) or is briefly overloaded — so a hiccup costs a retry, not a dropped rollout (vime/slime
         retry the same way). A 4xx is a real client bug, so it fails fast rather than burn the retry
         budget. The session sets no read timeout, so a slow generation never lands here at all."""
+        target = self._target_url(path, session_id)
         headers = {"x-session-id": session_id} if session_id else None
         body = {"model": self.model_name, **payload}
-        for attempt in range(20):
+        use_raw = isinstance(self.http, aiohttp.ClientSession) and (
+            "features" in payload or len(payload.get("token_ids") or ()) > 4096
+        )
+        raw_bytes = None
+        if use_raw:
+            raw_bytes = await asyncio.to_thread(
+                lambda b: json.dumps(b, separators=(",", ":")).encode("utf-8"),
+                body,
+            )
+            headers = {**(headers or {}), "Content-Type": "application/json"}
+        for attempt in range(max_attempts):
             try:
-                async with self.http.post(path, json=body, headers=headers) as resp:
+                post_kwargs = {"data": raw_bytes, "headers": headers} if raw_bytes is not None else {"json": body, "headers": headers}
+                async with self.http.post(target, **post_kwargs) as resp:
                     resp.raise_for_status()
                     return await resp.json()
             except (aiohttp.ClientResponseError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as e:
                 fatal = isinstance(e, aiohttp.ClientResponseError) and e.status < 500  # 4xx = real bug
-                if fatal or attempt == 19:
+                if fatal or attempt == max_attempts - 1:
                     raise
             await asyncio.sleep(1)
 
@@ -333,7 +379,10 @@ class RouterGenerateClient:
         template + mm processing) and return its ``{token_ids, features}``. We use ONLY ``features``
         (vLLM's mm pixel tensors -> N vision embeds); the placeholder ranges are realigned to our
         canonical prompt by the caller. The router forwards this custom route verbatim."""
-        urls = [await asyncio.to_thread(_image_data_uri, image) for image in images]
+        if len(images) <= 1:
+            urls = [await asyncio.to_thread(_image_data_uri, image) for image in images]
+        else:
+            urls = list(await asyncio.gather(*(asyncio.to_thread(_image_data_uri, image) for image in images)))
         content = [{"type": "image_url", "image_url": {"url": url}} for url in urls]
         body = {"messages": [{"role": "user", "content": content}]}
         return await self._post("/v1/chat/completions/render", body, session_id)
@@ -344,7 +393,46 @@ class RouterGenerateClient:
         body = {"token_ids": list(prompt_token_ids), "sampling_params": _inference_sampling_params(sampling_params)}
         if features is not None:
             body["features"] = features
-        out = await self._post("/inference/v1/generate", body, session_id)
+        if self._delta_mm_on and features is not None and isinstance(features.get("kwargs_data"), dict):
+            target_base = self._engine_for(session_id) or ""
+            sent = self._sent_hashes_for(session_id, target_base)
+            delta_kwargs = {}
+            elided = 0
+            mm_hashes = features.get("mm_hashes") or {}
+            for mod, items in features["kwargs_data"].items():
+                hashes = mm_hashes.get(mod) or []
+                if isinstance(items, list) and len(items) == len(hashes):
+                    out_items = []
+                    for h, item in zip(hashes, items):
+                        if item is not None and h in sent:
+                            out_items.append(None)
+                            elided += 1
+                        else:
+                            out_items.append(item)
+                    delta_kwargs[mod] = out_items
+                else:
+                    delta_kwargs[mod] = items
+            if elided > 0:
+                delta_features = {k: v for k, v in features.items() if k != "mm_metadata"}
+                delta_features["kwargs_data"] = delta_kwargs
+                delta_body = {**body, "features": delta_features}
+                try:
+                    out = await self._post("/inference/v1/generate", delta_body, session_id, max_attempts=1)
+                except aiohttp.ClientResponseError as e:
+                    if e.status >= 500:
+                        # Post-refit or LRU eviction cleared vLLM's P1 mm_receiver_cache:
+                        # immediately resend full kwargs_data once to repopulate the engine cache.
+                        sent.clear()
+                        out = await self._post("/inference/v1/generate", body, session_id)
+                    else:
+                        raise
+            else:
+                out = await self._post("/inference/v1/generate", body, session_id)
+            for hashes in mm_hashes.values():
+                if isinstance(hashes, list):
+                    sent.update(hashes)
+        else:
+            out = await self._post("/inference/v1/generate", body, session_id)
         c = out["choices"][0]
         ids = list(c.get("token_ids") or [])
         # logprobs=1 -> choice.logprobs.content[i] = {"token": "token_id:<id>", "logprob": ...}; a
@@ -431,12 +519,21 @@ class AgentRunnerActor:
         # succeed. slime takes the same position (httpx.Timeout(None) on its rollout client).
         # A crashed engine still surfaces immediately as a connection error, which _post retries.
         # limit=0: don't cap concurrency to the engine fleet at aiohttp's default of 100.
-        self._http = aiohttp.ClientSession(
-            base_url=router_url,
-            timeout=aiohttp.ClientTimeout(total=None),
-            connector=aiohttp.TCPConnector(limit=0),
-        )
-        self._client = RouterGenerateClient(self._http, model_name=model_name, image_token_id=image_token_id)
+        if isinstance(router_url, (list, tuple)):
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None),
+                connector=aiohttp.TCPConnector(limit=0),
+            )
+            self._client = RouterGenerateClient(
+                self._http, model_name=model_name, image_token_id=image_token_id, engine_urls=list(router_url)
+            )
+        else:
+            self._http = aiohttp.ClientSession(
+                base_url=router_url,
+                timeout=aiohttp.ClientTimeout(total=None),
+                connector=aiohttp.TCPConnector(limit=0),
+            )
+            self._client = RouterGenerateClient(self._http, model_name=model_name, image_token_id=image_token_id)
 
     async def ready(self):
         return True
@@ -505,5 +602,9 @@ def create_vllm_router(engines, *, policy="cache_aware", balance=(10, 1.2), port
     balance. ``consistent_hash`` hashed the per-rollout ``x-session-id`` blind to load, so engines
     filled unevenly and the slow one thrashed its KV cache."""
     engine_urls = ray.get([e.serve_openai.remote() for e in engines])
+    if policy == "consistent_hash" and os.environ.get("MOLT_DIRECT_ENGINE_ROUTING", "0") == "1":
+        # Bypass the single-node Rust router process: each AgentRunnerActor hashes session_id
+        # directly to one engine URL (48x network fan-out, zero proxy hop, 100% cache stickiness).
+        return None, list(engine_urls)
     router = VllmRouterActor.remote(engine_urls, policy=policy, balance=balance, port=port)
     return router, ray.get(router.ready.remote())

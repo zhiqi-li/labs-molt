@@ -213,6 +213,9 @@ class _Session:
     trajectories: list = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # serialize turns within a session
     last_messages: list | None = None  # the last turn's request: the next one extends it or starts a new segment
+    last_chat: list | None = None  # cached _messages_to_chat output for last_messages (avoids O(N^2) PNG decoding)
+    last_template_kwargs: dict | None = None
+    last_full_prompt: str | None = None
 
 
 class ChatServerState:
@@ -300,12 +303,34 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict, gone=
         and messages[:n] == session.last_messages
         and messages[n].get("role") == "assistant"
     )
-    chat, pil_images = await loop.run_in_executor(_TOKENIZE_EXECUTOR, _messages_to_chat, state, messages)
-    full = state.processor.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, **kwargs)
+
+    def _render_template(chat_rows: list, *, add_gen: bool) -> str:
+        return state.processor.apply_chat_template(chat_rows, tokenize=False, add_generation_prompt=add_gen, **kwargs)
+
+    pil_images = None
+    new_pil = None
+    if extends and session.last_chat is not None and len(session.last_chat) == n:
+        # Fast O(delta) continuation: reuse cached ChatML rows for messages[:n] instead of
+        # re-decoding every historical base64 PNG from scratch on every turn.
+        def _build_tail():
+            asst_chat, _ = _messages_to_chat(state, messages[n : n + 1])
+            tail_chat, tail_pil = _messages_to_chat(state, messages[n + 1 :])
+            merged = session.last_chat + asst_chat + tail_chat
+            full_str = _render_template(merged, add_gen=True)
+            pref_str = _render_template(merged[: n + 1], add_gen=False)
+            return merged, tail_pil, full_str, pref_str
+
+        chat, new_pil, full, prefix = await loop.run_in_executor(_TOKENIZE_EXECUTOR, _build_tail)
+    else:
+        def _build_full():
+            c, pils = _messages_to_chat(state, messages)
+            full_str = _render_template(c, add_gen=True)
+            pref_str = _render_template(c[: n + 1], add_gen=False) if extends else ""
+            return c, pils, full_str, pref_str
+
+        chat, pil_images, full, prefix = await loop.run_in_executor(_TOKENIZE_EXECUTOR, _build_full)
+
     if extends:
-        prefix = state.processor.apply_chat_template(
-            chat[: n + 1], tokenize=False, add_generation_prompt=False, **kwargs
-        )
         # The suffix slice below is only sound when the prior turns render the same in `full` and
         # `prefix`. A template can instead rewrite history in place — e.g. Qwen3 re-renders a prior
         # assistant turn WITHOUT its <think> block once a newer user query follows — and the slice
@@ -317,6 +342,8 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict, gone=
                 "re-tokenized segment and the policy does not see its earlier reasoning.",
                 stacklevel=2,
             )
+            if pil_images is None:
+                _, pil_images = await loop.run_in_executor(_TOKENIZE_EXECUTOR, _messages_to_chat, state, messages)
     if not extends:
         # New segment (episode start OR post-compaction/re-render): render the prompt in full +
         # tokenize (image count self-consistent with the vision encoder). process_prompt_with_images
@@ -358,11 +385,15 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict, gone=
         # feedback, so the stream stays the template's exact token sequence. A template that re-renders
         # the assistant text (trim, wrap) does not start with the generated action -> plain suffix.
         prev_action_text = session.last_action_text  # as generated, end-of-turn token included
-        generated = state.processor.apply_chat_template(chat[:n], tokenize=False, add_generation_prompt=True, **kwargs)
+        if session.last_full_prompt is not None and kwargs == session.last_template_kwargs:
+            generated = session.last_full_prompt
+        else:
+            generated = await loop.run_in_executor(_TOKENIZE_EXECUTOR, lambda: _render_template(chat[:n], add_gen=True))
         generated += prev_action_text  # history + generation prompt + the action exactly as generated
         closing = prefix[len(generated) :] if prefix.startswith(generated) else ""
         delta_text = closing + full[len(prefix) :]
-        _, new_pil = await loop.run_in_executor(_TOKENIZE_EXECUTOR, _messages_to_chat, state, messages[n + 1 :])
+        if new_pil is None:
+            _, new_pil = await loop.run_in_executor(_TOKENIZE_EXECUTOR, _messages_to_chat, state, messages[n + 1 :])
         saved_mm = (list(traj.pil_images), traj.mm_train_inputs, traj.image_budget)
         delta_ids = await loop.run_in_executor(
             _TOKENIZE_EXECUTOR, _tokenize_feedback, state.processor, delta_text, new_pil, traj, state.max_length
@@ -437,6 +468,9 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict, gone=
     traj.absorb_routing(request_output)
     session.last_messages = messages
     session.last_action_text = raw_action_text
+    session.last_chat = chat
+    session.last_template_kwargs = kwargs
+    session.last_full_prompt = full
     return action_text, finish_reason
 
 
