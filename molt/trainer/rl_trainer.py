@@ -818,6 +818,7 @@ class GenerateSamplesActor:
                     saved["recipe"]["rollout"].pop("vllm_generate_batch_size", None)
                     saved["recipe"]["rollout"].pop("max_tokens_per_gpu", None)
                     saved["recipe"]["vllm"].pop("router_policy", None)
+                    saved["recipe"]["vllm"].pop("gpu_memory_utilization", None)
                     if saved["recipe"] != bootstrap_recipe:
                         raise ValueError(f"Rollout bootstrap recipe differs from this run: {bootstrap_input}")
                     samples = saved["samples"]
