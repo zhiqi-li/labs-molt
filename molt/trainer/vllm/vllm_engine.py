@@ -406,11 +406,18 @@ def create_vllm_engines(
     # GPU is the only exclusive resource to reserve; CPU is shared, so pinning CPU in the engine
     # bundles (and on the actor below) only over-constrains PACK — with many small TP-per-node
     # bundles it can leave the placement group infeasible even when GPUs are free. Reserve GPU only.
+    vllm_res = os.environ.get("MOLT_VLLM_RESOURCE", "").strip()
     if distributed_executor_backend == "mp":
         gpus_per_engine = tensor_parallel_size * data_parallel_size
-        bundles = [{"GPU": gpus_per_engine} for _ in range(num_engines)]
+        bundles = [
+            {"GPU": gpus_per_engine, **({vllm_res: gpus_per_engine} if vllm_res else {})}
+            for _ in range(num_engines)
+        ]
     else:
-        bundles = [{"GPU": 1} for _ in range(num_engines * engine_world)]
+        bundles = [
+            {"GPU": 1, **({vllm_res: 1} if vllm_res else {})}
+            for _ in range(num_engines * engine_world)
+        ]
     shared_pg = placement_group(bundles, strategy="PACK")
     ray.get(shared_pg.ready())
 
