@@ -86,6 +86,18 @@ def add_ckpt_args(parser, default_ckpt_path: str) -> None:
         help="Also export an HF-format snapshot alongside each resumable checkpoint.",
     )
     parser.add_argument(
+        "--ckpt.save_hf_steps",
+        type=int,
+        default=1,
+        help="When --ckpt.save_hf is set, export HF safetensors only on steps divisible by N (default 1 = every save).",
+    )
+    parser.add_argument(
+        "--ckpt.async_save_hf",
+        action="store_true",
+        default=False,
+        help="Consolidate HF safetensors asynchronously in a rank-0 background subprocess from the DCP model shards.",
+    )
+    parser.add_argument(
         "--ckpt.disable_final_save",
         action="store_true",
         default=False,
