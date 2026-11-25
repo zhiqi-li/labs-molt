@@ -625,8 +625,13 @@ class GenerateSamplesActor:
         num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
         # SPREAD the runners: Ray's default PACK lands every runner (and its desktop-env VM) on the
         # first node with free CPUs, and that node's port range then runs out.
+        # Optional MOLT_AGENT_RUNNER_RESOURCE pins runners to dedicated env-rendering nodes (e.g. "env_egl").
+        runner_opts = {"scheduling_strategy": "SPREAD"}
+        env_resource = os.environ.get("MOLT_AGENT_RUNNER_RESOURCE", "").strip()
+        if env_resource:
+            runner_opts["resources"] = {env_resource: 1}
         agent_runners = [
-            AgentRunnerActor.options(scheduling_strategy="SPREAD").remote(
+            AgentRunnerActor.options(**runner_opts).remote(
                 strategy.args.train.agent_path,
                 router_url,
                 model_path=pretrain,
@@ -982,7 +987,12 @@ class RLTrainer:
 
         vllm_lock = VLLMLock.remote()
 
-        self.generator_actor = GenerateSamplesActor.remote(
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        head_node_id = ray.get_runtime_context().get_node_id()
+        self.generator_actor = GenerateSamplesActor.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=True),
+        ).remote(
             pretrain=pretrain,
             strategy=strategy,
             vllm_lock=vllm_lock,
