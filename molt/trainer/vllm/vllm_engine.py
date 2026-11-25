@@ -578,6 +578,11 @@ def create_vllm_engines(
                 "num_speculative_tokens": mtp_num_speculative_tokens,
             }
 
+        if os.environ.get("MOLT_FP32_LM_HEAD", "0") == "1":
+            hf_overrides = dict(actor_kwargs.get("hf_overrides") or {})
+            hf_overrides.setdefault("head_dtype", "float32")
+            actor_kwargs["hf_overrides"] = hf_overrides
+
         vllm_engines.append(
             RolloutRayActor.options(
                 num_cpus=0,  # GPU-only actor: CPU is shared, so reserving it only over-constrains the PG

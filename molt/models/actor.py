@@ -173,12 +173,14 @@ class Actor(BaseModel):
                     )
                 else:
                     local_active_mask = active
+            fp32_lm_head = os.environ.get("MOLT_FP32_LM_HEAD", "0") == "1"
             all_log_probs = chunked_head_log_probs(
                 logits,
                 self.model.lm_head,
                 targets,
                 temperature=self.temperature,
                 active_mask=local_active_mask,
+                cast_logits_to_input_dtype=not fp32_lm_head,
             )
         elif isinstance(logits, DTensor):
             all_log_probs = log_probs_from_vocab_parallel_logits(logits, targets, temperature=self.temperature)

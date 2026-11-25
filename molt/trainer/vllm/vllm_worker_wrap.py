@@ -18,6 +18,13 @@
 
 
 class WorkerWrap:
+    def init_worker_extension(self):
+        """Optional vLLM worker-side precision hooks run before model construction."""
+        import os
+
+        if os.environ.get("MOLT_VLLM_FP32_GDN_GATES", "0") == "1":
+            _keep_gdn_gates_fp32()
+
     def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend="nccl"):
         """Init torch process group for model weights update"""
         import torch
@@ -141,3 +148,35 @@ class WorkerWrap:
             return None
         held = {name for name, param in self.model_runner.model.named_parameters() if param.is_floating_point()}
         return sorted(held - loaded) if loaded <= held else None
+
+
+def _keep_gdn_gates_fp32():
+    """Keep Gated DeltaNet ``dt_bias`` parameters in fp32 before checkpoint/refit weight load.
+
+    vLLM 0.34 builds GDN ``A_log`` in fp32 but ``dt_bias`` in the model dtype (bf16),
+    rounding fp32 checkpoint/refit ``dt_bias`` on load while the trainer computes the
+    decay gate in fp32. Casting ``dt_bias`` in place before weight load preserves exact
+    fp32 gate alignment with zero VRAM/throughput overhead.
+    """
+    import torch
+    from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+
+    orig_create = BaseModelLoader.create_model
+    if getattr(orig_create, "_molt_fp32_gdn_gates", False):
+        return
+
+    def create_model(self, *args, **kwargs):
+        model = orig_create(self, *args, **kwargs)
+        n_layers = 0
+        for module in model.modules():
+            if isinstance(getattr(module, "A_log", None), torch.nn.Parameter) and isinstance(
+                getattr(module, "dt_bias", None), torch.nn.Parameter
+            ):
+                module.dt_bias.data = module.dt_bias.data.float()
+                n_layers += 1
+        if n_layers:
+            print(f"[vLLM] Kept dt_bias in fp32 across {n_layers} Gated DeltaNet layers", flush=True)
+        return model
+
+    create_model._molt_fp32_gdn_gates = True
+    BaseModelLoader.create_model = create_model
