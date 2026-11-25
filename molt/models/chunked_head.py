@@ -206,12 +206,20 @@ class ChunkedHeadLogProbs(torch.autograd.Function):
         return grad_hidden, grad_weight.to(weight.dtype), None, None, None, None, None
 
 
+try:
+    from torch.distributed.fsdp import FSDPModule
+except ImportError:
+    FSDPModule = None  # type: ignore[assignment,misc]
+
+
 def can_use_chunked_head(model: nn.Module, *, return_entropy: bool) -> bool:
     """True when ``model.lm_head`` can safely bypass full-vocab logits materialization."""
     if return_entropy or os.environ.get("MOLT_CHUNKED_LM_HEAD", "1") != "1":
         return False
     head = getattr(model, "lm_head", None)
-    if head is None or type(head) is not nn.Linear or head.bias is not None:
+    if head is None or not isinstance(head, nn.Linear) or head.bias is not None:
+        return False
+    if getattr(head, "lora_A", None) is not None or hasattr(head, "base_layer"):
         return False
     if getattr(head, "fp32", False):
         # Defer to external fp32-head patchers (e.g. ember_bridge_rl.frameworks.molt.precision).
@@ -229,6 +237,12 @@ def can_use_chunked_head(model: nn.Module, *, return_entropy: bool) -> bool:
 
 def ensure_chunked_head_hook(head: nn.Linear) -> None:
     """Wrap ``head.forward`` once so it yields hidden states only while ``_chunked_head_consumer`` names it."""
+    if FSDPModule is not None and isinstance(head, FSDPModule):
+        # Untied lm_head wrapped independently by FSDP2 (e.g. Qwen3.8-27B): keep weight
+        # unsharded across the lm_head forward boundary so chunked_head_log_probs can
+        # consume it right after _forward_backbone; FSDP2 post-backward reduce-scatters
+        # lm_head.weight.grad and reshards lm_head.weight cleanly.
+        head.set_reshard_after_forward(False)
     if getattr(head, "_molt_chunked_hooked", False):
         return
     orig_forward = head.forward
