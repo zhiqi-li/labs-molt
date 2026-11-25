@@ -56,6 +56,8 @@ def _ray_runtime_env_vars():
         "MOLT_VLLM_FP32_GDN_GATES",
         "MOLT_FP32_LM_HEAD",
         "MOLT_FP32_RESIDUAL",
+        "MOLT_TRAINER_WARMUP",
+        "MOLT_TRAINER_WARMUP_SEQLENS",
         "TRANSFORMERS_CACHE",
         "TORCH_COMPILE_DISABLE",
         "PYTORCH_CUDA_ALLOC_CONF",
