@@ -549,3 +549,90 @@ def test_generate_skips_frontend_detokenization_unless_stop_strings_need_it():
     asyncio.run(RouterGenerateClient(http).generate([1, 2], sp))
     spp = http.calls[0][1]["sampling_params"]
     assert "detokenize" not in spp and "flat_logprobs" not in spp and spp["stop"] == ["</answer>"]
+
+
+class _RenderByContentHttp:
+    """render returns one kwargs_data / mm_hashes item per image, derived from that image's data URI alone (as the
+    server does); generate echoes a fixed reply. Records every call."""
+
+    def __init__(self, extra_feature_key=False):
+        self.calls = []
+        self.extra = extra_feature_key
+
+    def post(self, url, json=None, headers=None):
+        self.calls.append((url, json, headers))
+        if url == RENDER:
+            urls = [c["image_url"]["url"] for c in json["messages"][0]["content"]]
+            features = {"mm_placeholders": {"image": [{"offset": 9, "length": 99} for _ in urls]},
+                        "kwargs_data": {"image": ["kw:" + u[-24:] for u in urls]},
+                        "mm_hashes": {"image": ["h:" + u[-12:] for u in urls]}}
+            if self.extra:
+                features["other"] = {}
+            return _FakeCtx({"token_ids": [], "features": features})
+        return _FakeCtx(_gen_resp([90]))
+
+
+def _turns(cache, monkeypatch, lists, http=None):
+    """Run one session through turns whose image lists are ``lists``; return (http, generate payloads)."""
+    monkeypatch.setenv("MOLT_RENDER_CACHE", "1" if cache else "0")
+    http = http or _RenderByContentHttp()
+    client = RouterGenerateClient(http, image_token_id=18)
+    for images in lists:
+        canonical = [1] + [18, 18, 3] * len(images) + [2]  # one placeholder run per image
+        asyncio.run(client.generate(canonical, _sp(), multi_modal_data={"image": images}, session_id="s1"))
+    return http, [json for url, json, _ in http.calls if url == GEN]
+
+
+def _growing_images(n):
+    from PIL import Image
+
+    images = [Image.new("RGB", (4 + i, 4), color=(i * 40 % 256, 7, 9)) for i in range(n)]
+    return [images[: k + 1] for k in range(n)]  # the chat server's list: same objects, one more each turn
+
+
+def test_render_cache_sends_bitwise_the_same_generate_payloads_and_renders_only_new_images(monkeypatch):
+    lists = _growing_images(4)
+    _, plain = _turns(False, monkeypatch, lists)
+    http, cached = _turns(True, monkeypatch, lists)
+    assert cached == plain  # every generate body (token ids, features, placeholders) identical to no cache
+    renders = [len(json["messages"][0]["content"]) for url, json, _ in http.calls if url == RENDER]
+    assert renders == [1, 1, 1, 1]  # without the cache: 1, 2, 3, 4
+
+
+def test_render_cache_reuses_everything_for_a_turn_without_new_images(monkeypatch):
+    lists = _growing_images(2)
+    lists.append(lists[-1])
+    _, plain = _turns(False, monkeypatch, lists)
+    http, cached = _turns(True, monkeypatch, lists)
+    assert cached == plain
+    assert [len(j["messages"][0]["content"]) for u, j, _ in http.calls if u == RENDER] == [1, 1]
+
+
+def test_render_cache_renders_everything_when_the_list_is_not_an_extension(monkeypatch):
+    from PIL import Image
+
+    a, b, c = (Image.new("RGB", (4, 4 + i)) for i in range(3))
+    lists = [[a, b], [a, c]]  # second turn replaced an image
+    _, plain = _turns(False, monkeypatch, lists)
+    http, cached = _turns(True, monkeypatch, lists)
+    assert cached == plain
+    assert [len(j["messages"][0]["content"]) for u, j, _ in http.calls if u == RENDER] == [2, 2]
+
+
+def test_render_cache_steps_aside_for_an_unknown_features_shape(monkeypatch):
+    lists = _growing_images(3)
+    _, plain = _turns(False, monkeypatch, lists, _RenderByContentHttp(extra_feature_key=True))
+    http, cached = _turns(True, monkeypatch, lists, _RenderByContentHttp(extra_feature_key=True))
+    assert cached == plain
+    assert [len(j["messages"][0]["content"]) for u, j, _ in http.calls if u == RENDER] == [1, 2, 3]
+
+
+def test_render_cache_is_off_by_default_and_bounded(monkeypatch):
+    monkeypatch.delenv("MOLT_RENDER_CACHE", raising=False)
+    assert RouterGenerateClient(_RenderByContentHttp())._render_cache_on is False
+    monkeypatch.setenv("MOLT_RENDER_CACHE", "1")
+    client = RouterGenerateClient(_RenderByContentHttp(), image_token_id=18)
+    images = _growing_images(1)[0]
+    for i in range(RouterGenerateClient.RENDER_CACHE_SESSIONS + 5):
+        asyncio.run(client.generate([1, 18, 18, 2], _sp(), multi_modal_data={"image": images}, session_id=f"s{i}"))
+    assert len(client._render_cache) == RouterGenerateClient.RENDER_CACHE_SESSIONS
