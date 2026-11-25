@@ -459,22 +459,41 @@ class BaseModel(nn.Module):
             moe_parallel_config=moe_config,
             activation_checkpointing=ac_setting,
         )
-        self.model = ModelCls.from_pretrained(
-            pretrain_or_model,
-            trust_remote_code=True,
-            torch_dtype=torch_dtype,
-            attn_implementation=attn_for_from_pretrained,
-            distributed_setup=dist_setup,
-            use_liger_kernel=False,
-            has_packed_sequence=packing_samples and not (self.is_vlm and self.cp_size > 1),
-            force_hf=False,
-            freeze_config={"freeze_vision_tower": True} if freeze_visual_encoder else None,
-            peft_config=self.peft_config,
-            # Disable the MTP head via AutoModel's config-override deep-merge (see
-            # _mtp_off_kwargs); no-op without MTP.
-            **_mtp_off_kwargs(pretrain_or_model),
-            **backend_kwarg,
-        )
+        # Optional whole-layer activation checkpointing (MOLT_FULL_LAYER_AC=1):
+        # uses AutoModel's apply_full_layer_checkpointing_to_layers (1 boundary tensor/layer
+        # instead of 4 submodule checkpoints/layer), cutting AC boundary VRAM by 4x on
+        # deep models such as Qwen3.8-27B (64L, H=5120: 100 GiB -> 25 GiB at CP=4).
+        _orig_full_layer_ac = None
+        _fsdp_parallelizer_cls = None
+        if os.environ.get("MOLT_FULL_LAYER_AC", "0") == "1":
+            try:
+                from nemo_automodel.components.distributed.parallelizer import ModelParallelizer
+
+                _fsdp_parallelizer_cls = ModelParallelizer
+                _orig_full_layer_ac = ModelParallelizer._use_full_layer_activation_checkpointing
+                ModelParallelizer._use_full_layer_activation_checkpointing = lambda self, model: True
+            except Exception:
+                _fsdp_parallelizer_cls = None
+        try:
+            self.model = ModelCls.from_pretrained(
+                pretrain_or_model,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+                attn_implementation=attn_for_from_pretrained,
+                distributed_setup=dist_setup,
+                use_liger_kernel=False,
+                has_packed_sequence=packing_samples and not (self.is_vlm and self.cp_size > 1),
+                force_hf=False,
+                freeze_config={"freeze_vision_tower": True} if freeze_visual_encoder else None,
+                peft_config=self.peft_config,
+                # Disable the MTP head via AutoModel's config-override deep-merge (see
+                # _mtp_off_kwargs); no-op without MTP.
+                **_mtp_off_kwargs(pretrain_or_model),
+                **backend_kwarg,
+            )
+        finally:
+            if _fsdp_parallelizer_cls is not None and _orig_full_layer_ac is not None:
+                _fsdp_parallelizer_cls._use_full_layer_activation_checkpointing = _orig_full_layer_ac
         # An unmatched --*.lora_target_modules leaves every parameter frozen (AutoModel freezes
         # the base before patching); fail instead of training nothing.
         if self.peft_config is not None and not any(p.requires_grad for p in self.model.parameters()):
