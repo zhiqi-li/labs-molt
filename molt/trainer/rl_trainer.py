@@ -1176,7 +1176,12 @@ class RLTrainer:
 
         vllm_lock = VLLMLock.remote()
 
-        self.generator_actor = GenerateSamplesActor.remote(
+        from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+        head_node_id = ray.get_runtime_context().get_node_id()
+        self.generator_actor = GenerateSamplesActor.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=head_node_id, soft=True),
+        ).remote(
             pretrain=pretrain,
             strategy=strategy,
             vllm_lock=vllm_lock,
