@@ -118,6 +118,10 @@ class WorkerWrap:
 
         with set_current_vllm_config(self.vllm_config):
             initialize_layerwise_reload(self.model_runner.model)
+        import os
+
+        if os.environ.get("MOLT_VLLM_FP32_GDN_GATES", "0") == "1":
+            _cast_gdn_gates_fp32(self.model_runner.model, quiet=True)
 
     def end_weight_update(self):
         """Process the layers the broadcast left incomplete; restore the ones it never touched."""
@@ -126,6 +130,10 @@ class WorkerWrap:
 
         with set_current_vllm_config(self.vllm_config):
             finalize_layerwise_reload(self.model_runner.model, self.model_config)
+        import os
+
+        if os.environ.get("MOLT_VLLM_FP32_GDN_GATES", "0") == "1":
+            _cast_gdn_gates_fp32(self.model_runner.model, quiet=True)
 
     def reset_weight_update_check(self):
         """Start collecting the param names ``load_weights`` assigns in the coming broadcast."""
@@ -150,6 +158,22 @@ class WorkerWrap:
         return sorted(held - loaded) if loaded <= held else None
 
 
+def _cast_gdn_gates_fp32(model, *, quiet: bool = False) -> int:
+    import torch
+
+    n_layers = 0
+    for module in model.modules():
+        if isinstance(getattr(module, "A_log", None), torch.nn.Parameter) and isinstance(
+            getattr(module, "dt_bias", None), torch.nn.Parameter
+        ):
+            if module.dt_bias.data.dtype != torch.float32:
+                module.dt_bias.data = module.dt_bias.data.float()
+            n_layers += 1
+    if n_layers and not quiet:
+        print(f"[vLLM] Kept dt_bias in fp32 across {n_layers} Gated DeltaNet layers", flush=True)
+    return n_layers
+
+
 def _keep_gdn_gates_fp32():
     """Keep Gated DeltaNet ``dt_bias`` parameters in fp32 before checkpoint/refit weight load.
 
@@ -158,7 +182,6 @@ def _keep_gdn_gates_fp32():
     decay gate in fp32. Casting ``dt_bias`` in place before weight load preserves exact
     fp32 gate alignment with zero VRAM/throughput overhead.
     """
-    import torch
     from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 
     orig_create = BaseModelLoader.create_model
@@ -167,15 +190,7 @@ def _keep_gdn_gates_fp32():
 
     def create_model(self, *args, **kwargs):
         model = orig_create(self, *args, **kwargs)
-        n_layers = 0
-        for module in model.modules():
-            if isinstance(getattr(module, "A_log", None), torch.nn.Parameter) and isinstance(
-                getattr(module, "dt_bias", None), torch.nn.Parameter
-            ):
-                module.dt_bias.data = module.dt_bias.data.float()
-                n_layers += 1
-        if n_layers:
-            print(f"[vLLM] Kept dt_bias in fp32 across {n_layers} Gated DeltaNet layers", flush=True)
+        _cast_gdn_gates_fp32(model)
         return model
 
     create_model._molt_fp32_gdn_gates = True
