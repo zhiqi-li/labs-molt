@@ -234,6 +234,7 @@ class FsdpStrategy:
         activation_checkpointing = resolve_ac_mode(
             getattr(_actor_cfg, "gradient_checkpoint", False) or getattr(_model_cfg, "gradient_checkpoint", False)
         )
+        _fsdp_reshard_after_fwd = os.environ.get("MOLT_FSDP_NO_RESHARD_AFTER_FWD", "0") != "1"
         self.distributed_config = FSDP2Config(
             sequence_parallel=self.sequence_parallel,
             mp_policy=mp_policy,
@@ -243,6 +244,7 @@ class FsdpStrategy:
             # microbatch itself (_set_fsdp_backward_sync), deferred to the optimizer-step
             # microbatch unless MOLT_DEFER_GRAD_SYNC=0.
             defer_fsdp_grad_sync=False,
+            reshard_after_forward=_fsdp_reshard_after_fwd,
         )
         # MoE parallelization config, required when ep_size > 1.
         # ignore_router_for_ac=True → selective AC that saves the router projection so

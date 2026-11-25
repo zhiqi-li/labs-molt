@@ -45,6 +45,8 @@ def _ray_runtime_env_vars():
         "MOLT_VLLM_SPEC_SUFFIX_DEPTH",
         "MOLT_VLLM_MM_CACHE_GB",
         "MOLT_VLLM_MM_CACHE_TYPE",
+        "MOLT_FSDP_NO_RESHARD_AFTER_FWD",
+        "MOLT_PAUSE_GC_DURING_TRAIN",
         "TRANSFORMERS_CACHE",
         "TORCH_COMPILE_DISABLE",
         "PYTORCH_CUDA_ALLOC_CONF",
