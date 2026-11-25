@@ -1029,8 +1029,14 @@ class PolicyModelActor(BaseModelActor):
         is_vlm = bool(getattr(self.actor, "is_vlm", False))
         top_k = int(getattr(args.algo.advantage, "score_centering_top_k", 0) or 0)
         image_token_id = getattr(model_cfg, "image_token_id", None)
+        vision_start_id = getattr(model_cfg, "vision_start_token_id", None)
+        vision_end_id = getattr(model_cfg, "vision_end_token_id", None)
         vision_cfg = getattr(model_cfg, "vision_config", None) if is_vlm else None
-        n_imgs = 4 if (is_vlm and image_token_id is not None and vision_cfg is not None) else 0
+        n_imgs = (
+            4
+            if (is_vlm and image_token_id is not None and vision_start_id is not None and vision_cfg is not None)
+            else 0
+        )
         if n_imgs > 0:
             patch = int(getattr(vision_cfg, "patch_size", 16))
             t_patch = int(getattr(vision_cfg, "temporal_patch_size", 2))
@@ -1068,8 +1074,15 @@ class PolicyModelActor(BaseModelActor):
                     else None
                 )
                 mm_inputs = {}
-                if n_imgs > 0 and 16 + n_imgs * toks_per_img < seqlen - act_len - 16:
-                    sequences[:, 16 : 16 + n_imgs * toks_per_img] = int(image_token_id)
+                span_per_img = toks_per_img + 2  # <vision_start> + image_tokens + <vision_end>
+                if n_imgs > 0 and 16 + n_imgs * (span_per_img + 4) < seqlen - act_len - 16:
+                    cursor = 16
+                    for _ in range(n_imgs):
+                        sequences[:, cursor] = int(vision_start_id)
+                        sequences[:, cursor + 1 : cursor + 1 + toks_per_img] = int(image_token_id)
+                        if vision_end_id is not None:
+                            sequences[:, cursor + 1 + toks_per_img] = int(vision_end_id)
+                        cursor += span_per_img + 4
                     mm_inputs["pixel_values"] = torch.zeros(
                         (n_imgs * h_p * w_p, pv_cols), dtype=torch.bfloat16, device=device
                     )
