@@ -16,9 +16,11 @@
 # Adapted from OpenRLHF (https://github.com/OpenRLHF/OpenRLHF),
 # Copyright (c) OpenRLHF contributors, licensed under the Apache License, Version 2.0.
 
+import gc
 import os
+import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import fields
 from typing import Dict, List, Optional
 
@@ -784,6 +786,35 @@ class PolicyModelActor(BaseModelActor):
                 )
             else:
                 self.trainer.verify_weight_sync()
+        # Move long-lived model/FSDP/Triton objects out of cyclic GC generations so
+        # subsequent gc.collect() calls stay sub-50ms instead of multi-second pauses.
+        if os.environ.get("MOLT_PAUSE_GC_DURING_TRAIN", "1") == "1":
+            gc.collect()
+            gc.freeze()
+
+    @staticmethod
+    @contextmanager
+    def _pause_gc_during_train():
+        """Suspend cyclic Python GC and Ray's async PythonGCThread during lockstep
+        multi-rank NCCL collectives, then run one synchronized gc.collect() afterward."""
+        if os.environ.get("MOLT_PAUSE_GC_DURING_TRAIN", "1") != "1":
+            yield
+            return
+        was_enabled = gc.isenabled()
+        gc.disable()
+        paused_threads = []
+        for t in threading.enumerate():
+            if t.name == "PythonGCThread" and hasattr(t, "_gc_collect_func"):
+                paused_threads.append((t, t._gc_collect_func))
+                t._gc_collect_func = lambda: 0
+        try:
+            yield
+        finally:
+            for t, orig_fn in paused_threads:
+                t._gc_collect_func = orig_fn
+            if was_enabled:
+                gc.enable()
+            gc.collect()
 
     def fit(self, kl_ctl: float = 0, train: bool = True):
         """Train actor model with the replay buffer.
@@ -794,10 +825,11 @@ class PolicyModelActor(BaseModelActor):
         """
         torch.cuda.empty_cache()
         status = {}
-        if train:
-            self.actor.train()
-            status = self.trainer.policy_train(kl_ctl)
-        self.trainer.replay_buffer.clear()
+        with self._pause_gc_during_train():
+            if train:
+                self.actor.train()
+                status = self.trainer.policy_train(kl_ctl)
+            self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         return status
@@ -847,7 +879,8 @@ class PolicyModelActor(BaseModelActor):
         return output["action_log_probs"].to("cpu")
 
     def broadcast_to_vllm(self):
-        self.trainer.broadcast_to_vllm()
+        with self._pause_gc_during_train():
+            self.trainer.broadcast_to_vllm()
 
     def get_checkpoint_states(self):
         return self.checkpoint_states
