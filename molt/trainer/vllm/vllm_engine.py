@@ -271,6 +271,10 @@ class RolloutRayActor:
         kwargs = {name: True for name in ("reset_running_requests", "reset_connector") if name in supported}
         if await self.llm.reset_prefix_cache(**kwargs) is False:
             print("[refit] WARNING: vLLM refused to reset the prefix cache; rollout may reuse stale KV", flush=True)
+        # Clear GPU vision-encoder embedding cache so updated vision weights take effect immediately
+        # (while keeping weight-independent preprocessed pixel_values in mm_processor_cache intact).
+        if hasattr(self.llm, "reset_encoder_cache"):
+            await self.llm.reset_encoder_cache()
 
 
 def create_vllm_engines(
@@ -397,11 +401,18 @@ def create_vllm_engines(
     # GPU is the only exclusive resource to reserve; CPU is shared, so pinning CPU in the engine
     # bundles (and on the actor below) only over-constrains PACK — with many small TP-per-node
     # bundles it can leave the placement group infeasible even when GPUs are free. Reserve GPU only.
+    vllm_res = os.environ.get("MOLT_VLLM_RESOURCE", "").strip()
     if distributed_executor_backend == "mp":
         gpus_per_engine = tensor_parallel_size * data_parallel_size
-        bundles = [{"GPU": gpus_per_engine} for _ in range(num_engines)]
+        bundles = [
+            {"GPU": gpus_per_engine, **({vllm_res: gpus_per_engine} if vllm_res else {})}
+            for _ in range(num_engines)
+        ]
     else:
-        bundles = [{"GPU": 1} for _ in range(num_engines * engine_world)]
+        bundles = [
+            {"GPU": 1, **({vllm_res: 1} if vllm_res else {})}
+            for _ in range(num_engines * engine_world)
+        ]
     shared_pg = placement_group(bundles, strategy="PACK")
     ray.get(shared_pg.ready())
 
@@ -443,13 +454,13 @@ def create_vllm_engines(
 
         if max_images_per_prompt > 0:
             actor_kwargs["limit_mm_per_prompt"] = {"image": max_images_per_prompt}
-            # Disable vLLM's mm preprocessor cache for VLM rollouts. The cache
-            # keys image features by content hash; after each weight broadcast
-            # cached entries become stale and the engine asserts on cache-miss
-            # (`mm_receiver_cache.get_and_update_item -> Expected a cached item`).
-            # Cost is recomputing image features per request — fine since the
-            # vision encoder is frozen and cheap relative to LM forward.
-            actor_kwargs["mm_processor_cache_gb"] = 0
+            # Default 0 preserves stock behavior; setting MOLT_VLLM_MM_CACHE_GB>0 (e.g. 8) enables
+            # vLLM's LRU mm_processor_cache so RouterGenerateClient can elide already-sent image
+            # pixel_values (kwargs_data[i]=None) on multi-turn VLM rollouts (~130x smaller payloads).
+            mm_cache_gb = float(os.environ.get("MOLT_VLLM_MM_CACHE_GB", "0") or 0)
+            actor_kwargs["mm_processor_cache_gb"] = mm_cache_gb
+            if mm_cache_gb > 0:
+                actor_kwargs["mm_processor_cache_type"] = os.environ.get("MOLT_VLLM_MM_CACHE_TYPE", "lru")
 
         # Pass-through only when the caller (or CLI) chose an explicit value, so
         # vLLM's own None→auto resolution (see config/vllm.py:844 for async,
@@ -544,7 +555,21 @@ def create_vllm_engines(
         # train the MTP head (matches verl/NeMo-RL: main-head-only RL loss). vLLM
         # errors at init if the served checkpoint has no MTP head (e.g.
         # Nemotron-Nano-Omni — see README).
-        if mtp_num_speculative_tokens and mtp_num_speculative_tokens > 0:
+        spec_method = os.environ.get("MOLT_VLLM_SPEC_METHOD", "").strip()
+        if spec_method:
+            spec_cfg = {
+                "method": spec_method,
+                "num_speculative_tokens": int(os.environ.get("MOLT_VLLM_SPEC_TOKENS", "8")),
+            }
+            if spec_method == "suffix":
+                spec_cfg["suffix_decoding_max_tree_depth"] = int(
+                    os.environ.get("MOLT_VLLM_SPEC_SUFFIX_DEPTH", "24")
+                )
+            elif spec_method == "ngram":
+                spec_cfg["prompt_lookup_max"] = int(os.environ.get("MOLT_VLLM_SPEC_NGRAM_MAX", "4"))
+                spec_cfg["prompt_lookup_min"] = int(os.environ.get("MOLT_VLLM_SPEC_NGRAM_MIN", "2"))
+            actor_kwargs["speculative_config"] = spec_cfg
+        elif mtp_num_speculative_tokens and mtp_num_speculative_tokens > 0:
             actor_kwargs["speculative_config"] = {
                 "method": "mtp",
                 "num_speculative_tokens": mtp_num_speculative_tokens,

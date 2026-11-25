@@ -590,7 +590,7 @@ def test_multiturn_vlm_carries_image_and_absorbs_a_new_one(monkeypatch):
         nonlocal new_image_loads
         if url == "u2":
             new_image_loads += 1
-            if new_image_loads == 2:
+            if new_image_loads == 1:
                 started.set()
                 if not release.wait(timeout=1):
                     timed_out.set()
