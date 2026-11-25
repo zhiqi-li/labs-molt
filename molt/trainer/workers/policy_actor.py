@@ -816,6 +816,144 @@ class PolicyModelActor(BaseModelActor):
                 gc.enable()
             gc.collect()
 
+    def warmup_compile(self):
+        """Run synthetic forward+backward passes (zero optimizer steps) while Batch 1 rolls out.
+
+        Pre-compiles Triton/FLA GDN, FlashAttention, chunked LM head, fp32 residual, ViT, and
+        FSDP2/CP NCCL rings before GL1 arrives while keeping trainer GPUs productively busy
+        during cold-start rollout generation. Weights, optimizer states, LR scheduler, and RNG
+        state are guaranteed bit-for-bit unchanged.
+        """
+        device = torch.device("cuda", torch.cuda.current_device())
+        args = self.strategy.args
+        cp_size = max(1, int(getattr(args.fsdp, "cp_size", 1) or 1))
+        align = 16 * cp_size
+        max_cap = int(getattr(args.train, "max_tokens_per_gpu", 65536) or 65536) * cp_size
+        raw_lens = os.environ.get("MOLT_TRAINER_WARMUP_SEQLENS", "16384,65536,131072")
+        seqlens = []
+        for tok in raw_lens.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            val = min(int(tok), max_cap)
+            val = max(align * 4, (val // align) * align)
+            if val not in seqlens:
+                seqlens.append(val)
+        if not seqlens:
+            return {"steps": 0, "seconds": 0.0}
+
+        model_cfg = getattr(self.actor.model, "config", None)
+        is_vlm = bool(getattr(self.actor, "is_vlm", False))
+        top_k = int(getattr(args.algo.advantage, "score_centering_top_k", 0) or 0)
+        image_token_id = getattr(model_cfg, "image_token_id", None)
+        vision_start_id = getattr(model_cfg, "vision_start_token_id", None)
+        vision_end_id = getattr(model_cfg, "vision_end_token_id", None)
+        vision_cfg = getattr(model_cfg, "vision_config", None) if is_vlm else None
+        n_imgs = (
+            4
+            if (is_vlm and image_token_id is not None and vision_start_id is not None and vision_cfg is not None)
+            else 0
+        )
+        if n_imgs > 0:
+            patch = int(getattr(vision_cfg, "patch_size", 16))
+            t_patch = int(getattr(vision_cfg, "temporal_patch_size", 2))
+            merge = int(getattr(vision_cfg, "spatial_merge_size", 2))
+            in_ch = int(getattr(vision_cfg, "in_channels", 3))
+            h_p = w_p = 256 // patch  # 16x16 patches for 256x256 LIBERO RGB frames
+            toks_per_img = (h_p // merge) * (w_p // merge)  # 64 visual tokens/image
+            pv_cols = in_ch * t_patch * patch * patch
+
+        def _param_fingerprint() -> float:
+            for p in self.actor.model.parameters():
+                if p.is_floating_point() and p.numel() > 0:
+                    local = p.to_local() if hasattr(p, "to_local") else p
+                    if local.numel() > 0:
+                        return float(local.detach().float().sum().item())
+            return 0.0
+
+        fp_before = _param_fingerprint()
+        t_all = time.time()
+        torch.cuda.reset_peak_memory_stats(device)
+        per_len = []
+
+        with torch.random.fork_rng(devices=[device]), self._pause_gc_during_train():
+            self.actor.train()
+            for seqlen in seqlens:
+                t0 = time.time()
+                sequences = torch.randint(10, 1000, (1, seqlen), dtype=torch.long, device=device)
+                attention_mask = torch.ones((1, seqlen), dtype=torch.long, device=device)
+                act_len = min(2048, max(align, seqlen // 8))
+                action_mask = torch.zeros((1, seqlen - 1), dtype=torch.bool, device=device)
+                action_mask[:, -act_len:] = True
+                top_ids = (
+                    torch.randint(10, 1000, (1, seqlen - 1, top_k), dtype=torch.long, device=device)
+                    if top_k > 1
+                    else None
+                )
+                mm_inputs = {}
+                span_per_img = toks_per_img + 2  # <vision_start> + image_tokens + <vision_end>
+                if n_imgs > 0 and 16 + n_imgs * (span_per_img + 4) < seqlen - act_len - 16:
+                    cursor = 16
+                    for _ in range(n_imgs):
+                        sequences[:, cursor] = int(vision_start_id)
+                        sequences[:, cursor + 1 : cursor + 1 + toks_per_img] = int(image_token_id)
+                        if vision_end_id is not None:
+                            sequences[:, cursor + 1 + toks_per_img] = int(vision_end_id)
+                        cursor += span_per_img + 4
+                    mm_inputs["pixel_values"] = torch.zeros(
+                        (n_imgs * h_p * w_p, pv_cols), dtype=torch.bfloat16, device=device
+                    )
+                    mm_inputs["image_grid_thw"] = torch.tensor(
+                        [[1, h_p, w_p]] * n_imgs, dtype=torch.long, device=device
+                    )
+
+                cp_context_stack = ExitStack()
+                try:
+                    out = self.actor(
+                        sequences,
+                        action_mask,
+                        attention_mask=attention_mask,
+                        cp_context_stack=cp_context_stack,
+                        return_entropy=bool(args.actor.entropy_coef),
+                        top_ids=top_ids,
+                        **mm_inputs,
+                    )
+                    loss = out["action_log_probs"].float().sum() * 1e-6
+                    if "action_top_log_probs" in out:
+                        loss = loss + out["action_top_log_probs"].float().sum() * 1e-6
+                    self.strategy.backward(
+                        loss,
+                        self.actor,
+                        self.actor_optim,
+                        name="actor",
+                        accumulate=False,
+                        scale_loss_by_accumulation=False,
+                        num_microbatches=1,
+                        sync_gradients=True,
+                    )
+                finally:
+                    cp_context_stack.close()
+                self.actor.zero_grad(set_to_none=True)
+                self.actor_optim.zero_grad(set_to_none=True)
+                del out, loss, sequences, attention_mask, action_mask, top_ids, mm_inputs
+                torch.cuda.synchronize()
+                per_len.append((seqlen, round(time.time() - t0, 1)))
+
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        fp_after = _param_fingerprint()
+        peak_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+        resv_gb = torch.cuda.max_memory_reserved(device) / (1024**3)
+        total_s = round(time.time() - t_all, 1)
+        delta = abs(fp_after - fp_before)
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[Warmup] Compiled {per_len} in {total_s}s | peak={peak_gb:.1f}/{resv_gb:.1f} GiB | param_delta={delta:.1e}",
+                flush=True,
+            )
+        assert delta == 0.0, f"Warmup unexpectedly modified weights (delta={delta})"
+        return {"seqlens": per_len, "seconds": total_s, "peak_gb": round(peak_gb, 1), "resv_gb": round(resv_gb, 1)}
+
     def fit(self, kl_ctl: float = 0, train: bool = True):
         """Train actor model with the replay buffer.
 
