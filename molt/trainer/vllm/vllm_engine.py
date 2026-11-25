@@ -575,6 +575,17 @@ def create_vllm_engines(
                 "num_speculative_tokens": mtp_num_speculative_tokens,
             }
 
+        if os.environ.get("MOLT_FP32_LM_HEAD", "0") == "1":
+            hf_overrides = dict(actor_kwargs.get("hf_overrides") or {})
+            hf_overrides.setdefault("head_dtype", "float32")
+            actor_kwargs["hf_overrides"] = hf_overrides
+
+        if os.environ.get("MOLT_VLLM_FP32_GDN_GATES", "0") == "1":
+            actor_kwargs.setdefault(
+                "worker_extension_cls",
+                "molt.trainer.vllm.vllm_engine.Fp32GateWorkerExtension",
+            )
+
         vllm_engines.append(
             RolloutRayActor.options(
                 num_cpus=0,  # GPU-only actor: CPU is shared, so reserving it only over-constrains the PG
@@ -603,3 +614,53 @@ def batch_vllm_engine_call(engines: List[Any], method_name: str, *args, rank_0_o
         method = getattr(engine, method_name)
         refs.append(method.remote(*args, **kwargs))
     return ray.get(refs)
+
+
+def _cast_gdn_gates_fp32(model, *, quiet: bool = False) -> int:
+    import torch
+
+    n_layers = 0
+    for module in model.modules():
+        if isinstance(getattr(module, "A_log", None), torch.nn.Parameter) and isinstance(
+            getattr(module, "dt_bias", None), torch.nn.Parameter
+        ):
+            if module.dt_bias.data.dtype != torch.float32:
+                module.dt_bias.data = module.dt_bias.data.float()
+            n_layers += 1
+    if n_layers and not quiet:
+        print(f"[vLLM] Kept dt_bias in fp32 across {n_layers} Gated DeltaNet layers", flush=True)
+    return n_layers
+
+
+class Fp32GateWorkerExtension:
+    """vLLM worker extension that keeps Gated DeltaNet ``dt_bias`` in fp32 across init and refit."""
+
+    def init_worker_extension(self):
+        from vllm.model_executor.model_loader import reload as vllm_reload
+        from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+
+        orig_create = BaseModelLoader.create_model
+        if not getattr(orig_create, "_molt_fp32_gdn_gates", False):
+
+            def create_model(loader_self, *args, **kwargs):
+                model = orig_create(loader_self, *args, **kwargs)
+                _cast_gdn_gates_fp32(model)
+                return model
+
+            create_model._molt_fp32_gdn_gates = True
+            BaseModelLoader.create_model = create_model
+
+        for fn_name in ("initialize_layerwise_reload", "finalize_layerwise_reload"):
+            orig_fn = getattr(vllm_reload, fn_name, None)
+            if orig_fn is not None and not getattr(orig_fn, "_molt_fp32_gdn_gates", False):
+
+                def _make_wrapped(fn):
+                    def wrapped(model, *args, **kwargs):
+                        res = fn(model, *args, **kwargs)
+                        _cast_gdn_gates_fp32(model, quiet=True)
+                        return res
+
+                    wrapped._molt_fp32_gdn_gates = True
+                    return wrapped
+
+                setattr(vllm_reload, fn_name, _make_wrapped(orig_fn))
