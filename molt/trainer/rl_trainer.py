@@ -861,6 +861,10 @@ class TrainingActor(BaseRLTrainer):
         self.rollout_slots = rollout_slots
 
     def fit(self, global_step: int = 0) -> None:
+        if os.environ.get("MOLT_TRAINER_WARMUP", "0") == "1":
+            warmup_t0 = time.time()
+            warmup_res = ray.get(self.actor_model_group.async_run_method(method_name="warmup_compile"))
+            logger.info(f"[Warmup] Trainer compile warmup finished in {time.time() - warmup_t0:.1f}s: {warmup_res[0]}")
         step_start_time = time.time()
         self._latest_client_states = {}
         while True:
