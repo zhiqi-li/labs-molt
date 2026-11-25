@@ -498,6 +498,8 @@ class BaseModel(nn.Module):
         # re-derive from the loaded class so the forward picks the right pack style.
         self._packing_style = "automodel" if is_automodel_custom_model(self.model) else "hf"
         configure_nemo_moe_aux_loss(self.model, moe_aux_loss_coef)
+        if os.environ.get("MOLT_FP32_RESIDUAL", "0") == "1":
+            _install_fp32_residual(self.model)
         if routing_replay:
             # R3: give every MoE gate a RouterReplay handle so the training forward
             # replays the rollout's expert selection. Done post from_pretrained (not via
@@ -880,3 +882,78 @@ class BaseModel(nn.Module):
         output = _normalize_output(output)
         output = attach_nemo_moe_aux_loss(output, self.model)
         return output, rolled_sequences, cp_forward, indices, batch, seqlen
+
+
+def _install_fp32_residual(model: nn.Module) -> None:
+    """Keep AutoModel dense Qwen3.5's residual stream in fp32 while linear/attn sublayers stay bf16.
+
+    Replaces each decoder block's FSDP2 ``MixedPrecisionPolicy.cast_forward_inputs`` with ``False``,
+    promotes ``embed_tokens`` output to fp32, keeps rotary cos/sin in ``compute_dtype``, and wraps
+    ``Qwen3_5FusedRMSNorm.forward`` so normalized outputs round once to ``weight.dtype`` while the
+    accumulated residual stream stays fp32.
+    """
+    import dataclasses
+    import importlib
+
+    inner = getattr(model, "model", None)
+    backbone = getattr(inner, "language_model", inner)
+    if type(backbone).__name__ != "Qwen3_5DenseTextBackbone":
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print(
+                f"[Precision] MOLT_FP32_RESIDUAL=1 skipped: expected Qwen3_5DenseTextBackbone, got {type(backbone).__name__}",
+                flush=True,
+            )
+        return
+    layers = getattr(backbone, "layers", None)
+    if not layers:
+        return
+    first_block = next(iter(layers.values()))
+    if not hasattr(first_block, "_get_fsdp_state"):
+        return
+    compute_dtype = first_block._get_fsdp_state()._mp_policy.param_dtype
+    if compute_dtype in (None, torch.float32):
+        return
+    for block in layers.values():
+        state = block._get_fsdp_state()
+        state._mp_policy = dataclasses.replace(state._mp_policy, cast_forward_inputs=False)
+
+    embed = backbone.embed_tokens
+    if not getattr(embed.forward, "_molt_fp32_residual", False):
+        orig_lookup = embed.forward
+
+        def fp32_embed(input_ids):
+            return orig_lookup(input_ids).float()
+
+        fp32_embed._molt_fp32_residual = True
+        embed.forward = fp32_embed
+
+    rotary_emb = backbone.rotary_emb
+    if not getattr(rotary_emb.forward, "_molt_fp32_residual", False):
+        orig_rotate = rotary_emb.forward
+
+        def compute_dtype_rotary(x, position_ids):
+            cos, sin = orig_rotate(x, position_ids)
+            return cos.to(compute_dtype), sin.to(compute_dtype)
+
+        compute_dtype_rotary._molt_fp32_residual = True
+        rotary_emb.forward = compute_dtype_rotary
+
+    q35_layers = importlib.import_module("nemo_automodel.components.models.qwen3_5.layers")
+    orig_norm = q35_layers.Qwen3_5FusedRMSNorm.forward
+    if not getattr(orig_norm, "_molt_fp32_residual", False):
+
+        def fp32_stream_norm(self, x, residual=None):
+            result = orig_norm(self, x, residual)
+            summed, normed = (None, result) if residual is None else result
+            if normed.dtype == torch.float32 and self.weight.dtype != torch.float32:
+                normed = normed.to(self.weight.dtype)
+            return normed if residual is None else (summed, normed)
+
+        fp32_stream_norm._molt_fp32_residual = True
+        q35_layers.Qwen3_5FusedRMSNorm.forward = fp32_stream_norm
+
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(
+            f"[Precision] Enabled native fp32 residual stream across {len(layers)} Qwen3.5 layers (sublayer compute={compute_dtype})",
+            flush=True,
+        )
