@@ -37,6 +37,8 @@ def _ray_runtime_env_vars():
         "HF_HOME",
         "HF_HUB_CACHE",
         "HUGGINGFACE_HUB_CACHE",
+        "MOLT_FSDP_NO_RESHARD_AFTER_FWD",
+        "MOLT_PAUSE_GC_DURING_TRAIN",
         "TRANSFORMERS_CACHE",
         "TORCH_COMPILE_DISABLE",
         "PYTORCH_CUDA_ALLOC_CONF",
