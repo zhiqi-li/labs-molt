@@ -33,6 +33,7 @@ from vllm import SamplingParams
 
 from molt.agents.base import _first_scalar as _to_scalar  # dedupe: same tensor/list/scalar normalizer
 from molt.trainer.algorithm.experience import Experience, get_model_parallel_size
+from molt.trainer.rollout.adaptive_sampler import AdaptiveDifficultyConfig, AdaptiveDifficultySampler
 from molt.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -347,6 +348,18 @@ class SamplesGenerator:
 
         self.prompts_dataloader = prompts_dataloader
         self.eval_dataloader = eval_dataloader
+        self._adaptive_sampler: Optional[AdaptiveDifficultySampler] = None
+        adaptive_cfg = AdaptiveDifficultyConfig.from_args(self.args)
+        if adaptive_cfg.enabled and prompts_dataloader is not None:
+            dataset = getattr(prompts_dataloader, "dataset", None)
+            if dataset is not None and getattr(dataset, "dataset", None) is not None:
+                self._adaptive_sampler = AdaptiveDifficultySampler.from_prompt_dataset(dataset, adaptive_cfg)
+                logger.info(
+                    f"[adaptive_sampler] enabled over {self._adaptive_sampler.num_tasks} shared tasks "
+                    f"({self._adaptive_sampler.epoch_budget} rows/episode, max_alpha={adaptive_cfg.max_alpha}, "
+                    f"ramp_steps={adaptive_cfg.ramp_steps}, ema={adaptive_cfg.ema_gamma}, "
+                    f"replay_floor={adaptive_cfg.replay_floor})"
+                )
 
     # Warm-resume (opt-in via --ckpt.warm_resume_rollouts). At every train step, save the rollout
     # groups that finished but were NOT trained yet — the surplus kept beyond the batch just shipped
@@ -358,10 +371,13 @@ class SamplesGenerator:
     _BUFFER = "rollout_buffer.pt"
 
     def state_dict(self) -> Dict:
-        """Save this step's untrained rollout groups to a fresh sidecar file, return its path."""
+        """Save this step's untrained rollout groups (if warm-resume) and adaptive sampler state."""
+        state: Dict = {}
+        if self._adaptive_sampler is not None:
+            state["adaptive_sampler"] = self._adaptive_sampler.state_dict()
         finished = getattr(self, "_finished_samples", None)
         if not getattr(self.args.ckpt, "warm_resume_rollouts", False) or not finished:
-            return {}
+            return state
         try:
             # The rollout is held as lazy Experiences whose heavy tensors (token ids / images /
             # routing) live in the runners' object stores (Experience.heavy_ref); those refs die
@@ -381,13 +397,22 @@ class SamplesGenerator:
                 key=lambda e: e.stat().st_mtime,
             )[:-3]:  # keep newest 3; bound disk
                 os.remove(stale.path)
-            return {"buffer_file": path}
+            state["buffer_file"] = str(path)
+            return state
         except Exception as e:  # bookkeeping must never break the checkpoint
             logger.warning(f"warm-resume: save skipped ({e})")
-            return {}
+            return state
 
     def load_state_dict(self, state_dict: Optional[Dict]) -> None:
-        """Restore this checkpoint's untrained groups (if any) to seed the first post-resume batch."""
+        """Restore adaptive sampler state and untrained warm-resume groups (if any)."""
+        if self._adaptive_sampler is not None and isinstance(state_dict, dict):
+            sampler_state = state_dict.get("adaptive_sampler")
+            if sampler_state is not None:
+                self._adaptive_sampler.load_state_dict(sampler_state)
+                logger.info(
+                    f"[adaptive_sampler] restored state at step={self._adaptive_sampler.step_ct}, "
+                    f"alpha={self._adaptive_sampler.current_alpha:.2f}"
+                )
         path = (state_dict or {}).get("buffer_file")
         if not path or not os.path.exists(path):
             return  # no file / failed save -> normal resume
@@ -459,12 +484,22 @@ class SamplesGenerator:
         # round returned exhausted=True. Keying on live pool state instead would mistake a
         # mid-stream exhausted iterator for a fresh round and drop the in-flight tail.
         if getattr(self, "_round_exhausted", True):
-            self._dataloader_iter = iter(self.prompts_dataloader)
+            if self._adaptive_sampler is not None:
+                self._adaptive_sampler.begin_round()
+                self._dataloader_iter = None if self._adaptive_sampler.exhausted else True
+            else:
+                self._dataloader_iter = iter(self.prompts_dataloader)
             # Seed from a warm-resume buffer if load_state_dict restored one, so the first
             # post-resume batch ships without waiting for a full fresh generation. Consumed once.
             self._finished_samples: List[Experience] = list(getattr(self, "_resumed_samples", None) or [])
             self._resumed_samples = None
             self._inflight_rollouts: List = []
+            self._inflight_tasks: Dict[int, str] = {}
+        else:
+            prior_tasks = getattr(self, "_inflight_tasks", {})
+            self._inflight_tasks = {
+                id(ref): prior_tasks[id(ref)] for ref in self._inflight_rollouts if id(ref) in prior_tasks
+            }
 
         groups_per_batch = self.args.rollout.batch_size
         inflight_capacity = getattr(self.args.rollout, "vllm_generate_batch_size", None) or groups_per_batch
@@ -492,14 +527,34 @@ class SamplesGenerator:
             if not partial_rollout:  # never more outstanding than this batch still needs: the pool ends empty
                 free_slots = min(free_slots, groups_per_batch - finished_group_count() - len(self._inflight_rollouts))
             if free_slots > 0 and self._dataloader_iter is not None:
-                prompts, labels, images, tools, dataloader_exhausted = _collect_prompt_batch(
-                    self._dataloader_iter, free_slots
-                )
-                prompts_dispatched += len(prompts)
-                if prompts:
-                    self._inflight_rollouts.extend(
-                        self._dispatch_to_agent_runners(prompts, labels, images=images, tools=tools, **generate_kwargs)
+                if self._adaptive_sampler is not None:
+                    drawn_items, drawn, dataloader_exhausted = self._adaptive_sampler.draw_unskipped(
+                        free_slots, prompts_dispatched, set()
                     )
+                    dataset = self.prompts_dataloader.dataset
+                    prompts, labels, images, tools, task_ids = [], [], [], [], []
+                    for ds_idx, tid, _offset in drawn_items:
+                        _, p, lbl, img, tool = dataset[ds_idx]
+                        prompts.append(p)
+                        labels.append(lbl)
+                        images.append(img)
+                        tools.append(tool)
+                        task_ids.append(tid)
+                    prompts_dispatched += drawn
+                else:
+                    prompts, labels, images, tools, dataloader_exhausted = _collect_prompt_batch(
+                        self._dataloader_iter, free_slots
+                    )
+                    task_ids = [None] * len(prompts)
+                    prompts_dispatched += len(prompts)
+                if prompts:
+                    dispatched_refs = self._dispatch_to_agent_runners(
+                        prompts, labels, images=images, tools=tools, **generate_kwargs
+                    )
+                    self._inflight_rollouts.extend(dispatched_refs)
+                    for ref, tid in zip(dispatched_refs, task_ids):
+                        if tid is not None:
+                            self._inflight_tasks[id(ref)] = tid
                 if dataloader_exhausted:
                     self._dataloader_iter = None
                     logger.info("Prompt dataloader is exhausted.")
@@ -512,6 +567,7 @@ class SamplesGenerator:
             for finished_rollout in ready:
                 if partial_bootstrap:
                     del self._bootstrap_parts[finished_rollout]
+                task_id = self._inflight_tasks.pop(id(finished_rollout), None)
                 groups_completed += 1
                 # Dropped groups (filtered, or short of a rollout) come back empty; their
                 # slot is refilled with a fresh prompt on the next iteration.
@@ -521,6 +577,7 @@ class SamplesGenerator:
                     drop_counts,
                     score_stats=score_stats,
                     whole_groups=True,
+                    task_id=task_id,
                     **generate_kwargs,
                 )
                 if group_samples:
@@ -551,6 +608,8 @@ class SamplesGenerator:
         if score_stats.get("groups", 0) > 0:
             rollout_metrics["rollout/group_all_pass_rate"] = score_stats["all_pass"] / score_stats["groups"] * 100
             rollout_metrics["rollout/group_all_fail_rate"] = score_stats["all_fail"] / score_stats["groups"] * 100
+        if self._adaptive_sampler is not None:
+            rollout_metrics.update(self._adaptive_sampler.pop_batch_metrics())
 
         # Hand back exactly `groups_per_batch` finished groups; keep any surplus for the next call.
         selected_groups: set = set()
@@ -596,6 +655,8 @@ class SamplesGenerator:
                     f"dropping the {len(batch_samples)}-sample epoch tail: fewer than {dp_groups} DP groups"
                 )
                 batch_samples = []
+        if self._adaptive_sampler is not None and batch_samples:
+            self._adaptive_sampler.advance_step()
         return batch_samples, rollout_metrics, prompts_dispatched, exhausted
 
     def _passes_dynamic_filter(self, rollout_samples) -> bool:
@@ -624,6 +685,7 @@ class SamplesGenerator:
         drop_counts: Dict[str, int],
         score_stats: Dict[str, float] | None = None,
         whole_groups: bool = False,
+        task_id: Optional[str] = None,
         **generate_kwargs,
     ) -> List[Experience]:
         """Filter one finished rollout (a prompt's N responses = one group) down to
@@ -646,25 +708,26 @@ class SamplesGenerator:
             elif drop_reason is not None:
                 drop_counts[drop_reason] += 1
 
+        group_mean_score: Optional[float] = None
+        min_score, max_score = self.args.algo.dynamic_filtering_range
         if group_samples and (whole_groups or dynamic_filtering):
             # Compaction can emit several step-samples with the same terminal score. Keep one
             # representative per rollout for filtering; all segments still enter training below.
             rollout_samples = {
                 (s.rollout_ids[0] if getattr(s, "rollout_ids", None) else id(s)): s for s in group_samples
             }.values()
+            scored = [s.scores[0].item() for s in rollout_samples if s.scores is not None]
+            if scored:
+                group_mean_score = sum(scored) / len(scored)
             # Pre-filter score stats (the model's TRUE judge pass rate over scored rollouts, BEFORE
             # DAPO drops uniform groups). Accumulate here, before any keep/drop decision, so the
             # logged mean reflects all-pass + all-fail + mixed (not just the kept mixed groups).
-            if dynamic_filtering and score_stats is not None:
-                scored = [s.scores[0].item() for s in rollout_samples if s.scores is not None]
-                if scored:
-                    min_score, max_score = self.args.algo.dynamic_filtering_range
-                    gmean = sum(scored) / len(scored)
-                    score_stats["score_sum"] += sum(scored)
-                    score_stats["score_n"] += len(scored)
-                    score_stats["groups"] += 1.0
-                    score_stats["all_pass"] += float(gmean >= max_score)
-                    score_stats["all_fail"] += float(gmean <= min_score)
+            if dynamic_filtering and score_stats is not None and scored:
+                score_stats["score_sum"] += sum(scored)
+                score_stats["score_n"] += len(scored)
+                score_stats["groups"] += 1.0
+                score_stats["all_pass"] += float(group_mean_score >= max_score)
+                score_stats["all_fail"] += float(group_mean_score <= min_score)
             # Training needs the group's rollouts for its baseline (eval keeps what it has): by default
             # every one of them (COMPLETE groups, as slime and miles do), or --rollout.min_group_samples
             # of them (PEAR keeps a group with two verified siblings; the dropped ones leave its
@@ -675,6 +738,14 @@ class SamplesGenerator:
             # remainder (at most DP-1 samples), since an uneven per-rank forward count desyncs NCCL.
             n_samples = generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)
             required = min(getattr(self.args.rollout, "min_group_samples", None) or n_samples, n_samples)
+            if self._adaptive_sampler is not None and task_id is not None:
+                self._adaptive_sampler.update(
+                    task_id,
+                    group_mean_score,
+                    min_score=min_score,
+                    num_rollouts=len(scored),
+                    min_rollouts=required,
+                )
             n_rollouts = len(rollout_samples)
             if n_rollouts < required:
                 drop_counts["incomplete_group"] += len(group_samples)
@@ -682,6 +753,9 @@ class SamplesGenerator:
             if dynamic_filtering and not self._passes_dynamic_filter(rollout_samples):
                 drop_counts["dynamic_filter"] += len(group_samples)
                 return []
+        elif self._adaptive_sampler is not None and task_id is not None:
+            # Release inflight slot on completely dropped/empty groups without skewing EMA.
+            self._adaptive_sampler.update(task_id, None, min_score=min_score)
         return group_samples
 
     def _generate_batch(

@@ -712,6 +712,7 @@ class GenerateSamplesActor:
             },
             "reward": vars(self.args.reward),
             "filter": (self.args.algo.dynamic_filtering_enable, self.args.algo.dynamic_filtering_range),
+            "adaptive_difficulty_active": self.samples_generator._adaptive_sampler is not None,
             "sampling": self.generate_kwargs,
         }
         if bootstrap_resume:
@@ -859,6 +860,9 @@ class GenerateSamplesActor:
                             dl_state = client_states.get("data_loader_state_dict") or {}
                             if dl_state and client_states.get("episode", ep) == ep:
                                 self.prompts_dataloader.load_state_dict(dl_state)
+                            gen_state = client_states.get("rollout_generator_state_dict")
+                            if gen_state:
+                                self.samples_generator.load_state_dict(gen_state)
                             if next_cursor > total_consumed_prompts:
                                 pbar.update(next_cursor - total_consumed_prompts)
                             total_consumed_prompts = next_cursor

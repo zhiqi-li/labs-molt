@@ -59,6 +59,7 @@ def _ray_runtime_env_vars():
         "MOLT_FP32_RESIDUAL",
         "MOLT_TRAINER_WARMUP",
         "MOLT_TRAINER_WARMUP_SEQLENS",
+        "MOLT_ADAPTIVE_DIFFICULTY",
         "TRANSFORMERS_CACHE",
         "TORCH_COMPILE_DISABLE",
         "PYTORCH_CUDA_ALLOC_CONF",
@@ -905,6 +906,36 @@ if __name__ == "__main__":
     )
     parser.add_argument("--rollout.top_p", type=float, default=1.0)
     parser.add_argument("--rollout.temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_enable",
+        action="store_true",
+        default=False,
+        help="Progressively sample harder learnable tasks across shared task seeds (also via MOLT_ADAPTIVE_DIFFICULTY=1).",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_alpha",
+        type=float,
+        default=2.0,
+        help="Max difficulty sharpness exponent (ramped linearly from 0 to alpha over ramp_steps).",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_ramp_steps",
+        type=int,
+        default=40,
+        help="Number of training batches to ramp adaptive difficulty sharpness from 0 to alpha.",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_ema",
+        type=float,
+        default=0.35,
+        help="EMA smoothing factor for task-shared pass rate updates.",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_replay_floor",
+        type=float,
+        default=0.05,
+        help="Minimum anti-forgetting sampling weight floor for mastered tasks.",
+    )
 
     # Training (loop hyperparameters; optimizer/scheduler/grad-clip are in the shared block above)
     parser.add_argument("--train.batch_size", type=int, default=128, help="Global training batch size")
