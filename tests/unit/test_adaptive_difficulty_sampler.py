@@ -76,7 +76,15 @@ class TestAdaptiveDifficultySampler(unittest.TestCase):
         self.assertTrue(all(0 <= i < 5 for i in seen_a))
 
     def test_progressive_ramp_peaks_at_learnable_frontier_and_suppresses_easy(self):
-        cfg = AdaptiveDifficultyConfig(enabled=True, max_alpha=2.0, ramp_steps=20, ema_gamma=0.5, replay_floor=0.05)
+        cfg = AdaptiveDifficultyConfig(
+            enabled=True,
+            schedule_mode="frontier_v1",
+            max_alpha=2.0,
+            warmup_steps=0,
+            ramp_steps=20,
+            ema_gamma=0.5,
+            replay_floor=0.05,
+        )
         sampler = AdaptiveDifficultySampler(
             {"easy": [0, 1], "medium": [2, 3], "frontier": [4, 5]},
             cfg,
@@ -100,6 +108,71 @@ class TestAdaptiveDifficultySampler(unittest.TestCase):
         self.assertGreater(p_late["easy"], 0.05)
         self.assertLess(p_late["easy"], p_early["easy"])
 
+    def test_v2_variance_mode_peaks_at_half_with_bounded_floor_and_warmup_gate(self):
+        cfg = AdaptiveDifficultyConfig(
+            enabled=True,
+            schedule_mode="variance",
+            max_alpha=1.5,
+            warmup_steps=10,
+            warmup_obs_per_task=2,
+            ramp_steps=20,
+            ema_gamma=0.5,
+            replay_floor=0.25,
+            balance_exponent=0.0,
+        )
+        sampler = AdaptiveDifficultySampler(
+            {"easy": [0, 1], "mid": [2, 3], "hard": [4, 5], "wall": [6, 7]},
+            cfg,
+        )
+        for _ in range(12):
+            sampler.update("easy", 1.0)
+            sampler.update("mid", 0.50)
+            sampler.update("hard", 0.25)
+            sampler.update("wall", 0.0)
+
+        # During warmup_steps (0..10), alpha stays strictly 0 (uniform exploration).
+        for _ in range(10):
+            self.assertAlmostEqual(sampler.current_alpha, 0.0)
+            sampler.advance_step()
+        self.assertAlmostEqual(sampler.current_alpha, 0.0)
+
+        # After warmup + ramp, peak is strictly at p=0.50 (mid), above both easy and hard,
+        # while replay_floor=0.25 bounds peak-to-floor ratio <= 5x.
+        for _ in range(25):
+            sampler.advance_step()
+        self.assertAlmostEqual(sampler.current_alpha, 1.5)
+        probs = sampler.sampling_probabilities(include_inflight=False)
+        self.assertGreater(probs["mid"], probs["hard"])
+        self.assertGreater(probs["mid"], probs["easy"] * 2.5)
+        self.assertLess(probs["mid"] / probs["easy"], 5.5)
+        self.assertLess(probs["mid"] / probs["wall"], 5.5)
+
+    def test_v2_anti_starvation_calibrates_all_tasks_and_bounds_update_skew(self):
+        cfg = AdaptiveDifficultyConfig(
+            enabled=True,
+            schedule_mode="variance",
+            max_alpha=1.5,
+            warmup_steps=0,
+            warmup_obs_per_task=2,
+            ramp_steps=1,
+            replay_floor=0.25,
+            balance_exponent=0.5,
+            seed=17,
+        )
+        buckets = {f"s/t{i}": list(range(i * 16, (i + 1) * 16)) for i in range(10)}
+        sampler = AdaptiveDifficultySampler(buckets, cfg, epoch_budget=200)
+        sampler.advance_step()
+        sampler.begin_round()
+        # First 20 draws must calibrate every task to >= 2 observations (zero starvation!).
+        for _ in range(20):
+            pairs, _ = sampler.draw(1)
+            _, tid = pairs[0]
+            sampler.update(tid, 0.0 if tid.endswith("0") else 0.5, num_rollouts=8, min_rollouts=6)
+        self.assertTrue(all(st.update_ct >= 2 for st in sampler._tasks.values()))
+        # Zero streak of 2 must NOT trigger cooling (min_streak=3).
+        self.assertEqual(sampler._tasks["s/t0"].zero_streak, 2)
+        self.assertGreater(sampler.task_weight("s/t0", include_inflight=False), cfg.replay_floor)
+
     def test_p2_suite_stratified_preserves_original_suite_quotas(self):
         # 90 L90 tasks x 16 seeds = 1440 rows (50%) vs 40 L40 tasks x 36 seeds = 1440 rows (50%).
         rows = []
@@ -111,7 +184,15 @@ class TestAdaptiveDifficultySampler(unittest.TestCase):
                 for s in range(36):
                     rows.append({"datasource": f"libero/train/{suite_name}", "prompt": f"p40_{suite_i}_{j}_{s}", "label": {"cell": f"{suite_name}/t{j}"}})
         ds = _FakePromptDataset(rows)
-        cfg = AdaptiveDifficultyConfig(enabled=True, max_alpha=2.0, ramp_steps=1, suite_stratified=True)
+        cfg = AdaptiveDifficultyConfig(
+            enabled=True,
+            schedule_mode="variance",
+            max_alpha=1.5,
+            warmup_steps=0,
+            warmup_obs_per_task=0,
+            ramp_steps=1,
+            suite_stratified=True,
+        )
         sampler = AdaptiveDifficultySampler.from_prompt_dataset(ds, cfg)
         sampler.advance_step()
 
@@ -130,7 +211,10 @@ class TestAdaptiveDifficultySampler(unittest.TestCase):
     def test_p2_zero_streak_ignores_incomplete_groups_and_explicit_probe_fires(self):
         cfg = AdaptiveDifficultyConfig(
             enabled=True,
-            max_alpha=2.0,
+            schedule_mode="variance",
+            max_alpha=1.5,
+            warmup_steps=0,
+            warmup_obs_per_task=0,
             ramp_steps=1,
             ema_gamma=0.5,
             zero_cooldown_tau=2.0,

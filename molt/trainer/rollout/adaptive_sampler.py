@@ -80,32 +80,59 @@ def extract_task_key(label: Any, datasource: str = "default", prompt: Any = "") 
 
 @dataclass(frozen=True)
 class AdaptiveDifficultyConfig:
-    """Hyperparameters for progressive task-shared difficulty sampling."""
+    """Hyperparameters for progressive task-shared difficulty sampling.
+
+    ``schedule_mode="variance"`` (v2 default) weights tasks by symmetric Bernoulli variance
+    ``(4 * (p + d) * (1 - p + d) / (1 + 2d)^2) ** alpha(t)`` peaking at ``p = 0.50``
+    (99.2% mixed-group probability at n=8 and 1:1 positive/negative rollout balance), with
+    warmup calibration (``warmup_steps``, ``warmup_obs_per_task``), generous anti-forgetting
+    ``replay_floor=0.25``, bounded ``zero_streak`` cooling, and within-suite frequency-balance
+    damping (``balance_exponent=0.5``) to prevent per-task starvation.
+
+    ``schedule_mode="frontier_v1"`` preserves the legacy ``(1 - p)^alpha * (p + d)^beta``
+    curve peaking near ``p = 0.30`` for regression tests and ablations.
+    """
 
     enabled: bool = False
-    max_alpha: float = 2.0
+    schedule_mode: str = "variance"
+    max_alpha: float = 1.5
+    warmup_steps: int = 10
+    warmup_obs_per_task: int = 2
     ramp_steps: int = 40
     ema_gamma: float = 0.35
-    replay_floor: float = 0.05
+    replay_floor: float = 0.25
+    balance_exponent: float = 0.5
     frontier_beta: float = 1.0
     frontier_delta: float = 0.05
+    zero_cooldown_min_streak: int = 3
     zero_cooldown_tau: float = 3.0
-    probe_interval_draws: int = 250
+    zero_cooldown_floor: float = 0.25
+    probe_interval_draws: int = 150
     prior_pass_rate: float = 0.5
     suite_stratified: bool = True
     seed: int = 42
 
     def __post_init__(self) -> None:
+        if self.schedule_mode not in ("variance", "frontier_v1"):
+            raise ValueError(f"schedule_mode must be 'variance' or 'frontier_v1', got {self.schedule_mode!r}")
         if self.max_alpha < 0:
             raise ValueError(f"max_alpha must be >= 0, got {self.max_alpha}")
+        if self.warmup_steps < 0:
+            raise ValueError(f"warmup_steps must be >= 0, got {self.warmup_steps}")
+        if self.warmup_obs_per_task < 0:
+            raise ValueError(f"warmup_obs_per_task must be >= 0, got {self.warmup_obs_per_task}")
         if self.ramp_steps < 0:
             raise ValueError(f"ramp_steps must be >= 0, got {self.ramp_steps}")
         if not 0.0 < self.ema_gamma <= 1.0:
             raise ValueError(f"ema_gamma must be in (0, 1], got {self.ema_gamma}")
         if self.replay_floor < 0:
             raise ValueError(f"replay_floor must be >= 0, got {self.replay_floor}")
+        if self.balance_exponent < 0:
+            raise ValueError(f"balance_exponent must be >= 0, got {self.balance_exponent}")
         if self.zero_cooldown_tau <= 0:
             raise ValueError(f"zero_cooldown_tau must be > 0, got {self.zero_cooldown_tau}")
+        if not 0.0 <= self.zero_cooldown_floor <= 1.0:
+            raise ValueError(f"zero_cooldown_floor must be in [0, 1], got {self.zero_cooldown_floor}")
 
     @classmethod
     def from_args(cls, args: Any) -> "AdaptiveDifficultyConfig":
@@ -115,10 +142,14 @@ class AdaptiveDifficultyConfig:
         enabled = cli_enable or _env_enabled("MOLT_ADAPTIVE_DIFFICULTY", False)
         return cls(
             enabled=enabled,
-            max_alpha=float(getattr(rollout, "adaptive_difficulty_alpha", 2.0)),
+            schedule_mode=str(getattr(rollout, "adaptive_difficulty_mode", "variance")),
+            max_alpha=float(getattr(rollout, "adaptive_difficulty_alpha", 1.5)),
+            warmup_steps=int(getattr(rollout, "adaptive_difficulty_warmup_steps", 10)),
+            warmup_obs_per_task=int(getattr(rollout, "adaptive_difficulty_warmup_obs", 2)),
             ramp_steps=int(getattr(rollout, "adaptive_difficulty_ramp_steps", 40)),
             ema_gamma=float(getattr(rollout, "adaptive_difficulty_ema", 0.35)),
-            replay_floor=float(getattr(rollout, "adaptive_difficulty_replay_floor", 0.05)),
+            replay_floor=float(getattr(rollout, "adaptive_difficulty_replay_floor", 0.25)),
+            balance_exponent=float(getattr(rollout, "adaptive_difficulty_balance_exp", 0.5)),
             seed=int(getattr(train, "seed", 42)),
         )
 
@@ -226,9 +257,12 @@ class AdaptiveDifficultySampler:
 
     @property
     def current_alpha(self) -> float:
+        effective_step = self.step_ct - self.config.warmup_steps
+        if effective_step <= 0:
+            return 0.0 if self.config.warmup_steps > 0 or self.config.ramp_steps > 0 else self.config.max_alpha
         if self.config.ramp_steps <= 0:
             return self.config.max_alpha
-        progress = min(1.0, max(0.0, self.step_ct / float(self.config.ramp_steps)))
+        progress = min(1.0, max(0.0, effective_step / float(self.config.ramp_steps)))
         return self.config.max_alpha * progress
 
     def begin_round(self) -> None:
@@ -258,34 +292,63 @@ class AdaptiveDifficultySampler:
 
     def _is_probe_due(self, st: _TaskState) -> bool:
         return (
-            st.zero_streak >= 3
+            st.zero_streak >= self.config.zero_cooldown_min_streak
             and st.inflight_ct == 0
             and (self.draw_seq - st.last_draw_seq) >= self.config.probe_interval_draws
         )
 
-    def task_weight(self, task_id: str, *, include_inflight: bool = True) -> float:
+    def _suite_mean_updates(self, suite: str) -> float:
+        tids = self._suite_tasks.get(suite) or self._task_ids
+        return sum(self._tasks[t].update_ct for t in tids) / max(1, len(tids))
+
+    def task_weight(self, task_id: str, *, include_inflight: bool = True, suite_mean_upd: Optional[float] = None) -> float:
         st = self._tasks[task_id]
         cfg = self.config
         alpha = self.current_alpha
         p = min(1.0, max(0.0, st.ema_pass_rate))
 
-        # Unimodal frontier score: with alpha=2.0, beta=1.0, delta=0.05 this peaks at p=0.30
-        # (~94% mixed-group probability for n=8 rollouts) while suppressing mastered tasks (p -> 1).
-        frontier = ((1.0 - p) ** alpha) * ((p + cfg.frontier_delta) ** cfg.frontier_beta)
+        if cfg.schedule_mode == "variance":
+            # Symmetric Bernoulli-variance frontier peaking at p = 0.50:
+            # 99.2% mixed-group rate at n=8 with 1:1 positive/negative balance (avoids length bloat).
+            if st.update_ct < cfg.warmup_obs_per_task:
+                frontier = 1.0
+            else:
+                d = cfg.frontier_delta
+                norm_var = (4.0 * (p + d) * (1.0 - p + d)) / ((1.0 + 2.0 * d) ** 2)
+                frontier = norm_var ** alpha
 
-        if st.zero_streak > 0 and not self._is_probe_due(st):
-            cooldown = math.exp(-st.zero_streak / cfg.zero_cooldown_tau)
+            if st.zero_streak >= cfg.zero_cooldown_min_streak and not self._is_probe_due(st):
+                excess = st.zero_streak - cfg.zero_cooldown_min_streak + 1
+                cooldown = max(cfg.zero_cooldown_floor, math.exp(-excess / cfg.zero_cooldown_tau))
+            else:
+                cooldown = 1.0
+
+            weight = cfg.replay_floor + frontier * cooldown
+            if cfg.balance_exponent > 0.0:
+                mean_u = self._suite_mean_updates(st.suite) if suite_mean_upd is None else suite_mean_upd
+                ratio = (mean_u + 1.0) / (st.update_ct + 1.0)
+                balance = min(2.0, max(0.5, ratio ** cfg.balance_exponent))
+                weight *= balance
         else:
-            cooldown = 1.0
+            # Legacy frontier_v1 curve peaking near p = 0.30.
+            frontier = ((1.0 - p) ** alpha) * ((p + cfg.frontier_delta) ** cfg.frontier_beta)
+            if st.zero_streak > 0 and not self._is_probe_due(st):
+                cooldown = math.exp(-st.zero_streak / cfg.zero_cooldown_tau)
+            else:
+                cooldown = 1.0
+            weight = cfg.replay_floor + frontier * cooldown
 
-        weight = cfg.replay_floor + frontier * cooldown
         if include_inflight and st.inflight_ct > 0:
             weight /= 1.0 + st.inflight_ct
         return max(weight, 1e-9)
 
     def sampling_probabilities(self, *, include_inflight: bool = True) -> Dict[str, float]:
         if not self.config.suite_stratified or len(self._suites) <= 1:
-            weights = {tid: self.task_weight(tid, include_inflight=include_inflight) for tid in self._task_ids}
+            mean_u = sum(st.update_ct for st in self._tasks.values()) / max(1, len(self._tasks))
+            weights = {
+                tid: self.task_weight(tid, include_inflight=include_inflight, suite_mean_upd=mean_u)
+                for tid in self._task_ids
+            }
             total = sum(weights.values())
             return {tid: w / total for tid, w in weights.items()}
 
@@ -294,7 +357,11 @@ class AdaptiveDifficultySampler:
         for suite, s_weight in zip(self._suites, self._suite_weights):
             s_prob = s_weight / suite_total
             tids = self._suite_tasks[suite]
-            t_weights = [self.task_weight(tid, include_inflight=include_inflight) for tid in tids]
+            mean_u = self._suite_mean_updates(suite)
+            t_weights = [
+                self.task_weight(tid, include_inflight=include_inflight, suite_mean_upd=mean_u)
+                for tid in tids
+            ]
             t_sum = sum(t_weights)
             for tid, tw in zip(tids, t_weights):
                 probs[tid] = s_prob * (tw / t_sum)
@@ -310,9 +377,21 @@ class AdaptiveDifficultySampler:
         if self.config.suite_stratified and len(self._suites) > 1:
             suite = self._rng.choices(self._suites, weights=self._suite_weights, k=1)[0]
             candidate_tids = self._suite_tasks[suite]
+            mean_u = self._suite_mean_updates(suite)
         else:
             candidate_tids = self._task_ids
-        weights = [self.task_weight(tid, include_inflight=True) for tid in candidate_tids]
+            mean_u = sum(st.update_ct for st in self._tasks.values()) / max(1, len(self._tasks))
+
+        # In variance mode, ensure full task calibration before applying skew within a suite.
+        if self.config.schedule_mode == "variance" and self.config.warmup_obs_per_task > 0:
+            under = [
+                tid for tid in candidate_tids
+                if (self._tasks[tid].update_ct + self._tasks[tid].inflight_ct) < self.config.warmup_obs_per_task
+            ]
+            if under:
+                return min(under, key=lambda tid: (self._tasks[tid].update_ct + self._tasks[tid].inflight_ct, self._tasks[tid].last_draw_seq))
+
+        weights = [self.task_weight(tid, include_inflight=True, suite_mean_upd=mean_u) for tid in candidate_tids]
         return self._rng.choices(candidate_tids, weights=weights, k=1)[0]
 
     def _draw_one(self, *, mark_inflight: bool) -> Tuple[int, str]:
@@ -402,6 +481,9 @@ class AdaptiveDifficultySampler:
     def pop_batch_metrics(self) -> Dict[str, float]:
         """Return aggregate sampler telemetry for the completed step and reset batch accumulators."""
         ps = [st.ema_pass_rate for st in self._tasks.values()]
+        upds = [st.update_ct for st in self._tasks.values()]
+        min_u = min(upds) if upds else 0
+        max_u = max(upds) if upds else 0
         metrics: Dict[str, float] = {
             "rollout/sampler_alpha": float(self.current_alpha),
             "rollout/sampler_mean_p": sum(ps) / len(ps),
@@ -409,8 +491,14 @@ class AdaptiveDifficultySampler:
             "rollout/sampler_num_frontier": float(
                 sum(1 for st in self._tasks.values() if 0.05 < st.ema_pass_rate < 0.85)
             ),
-            "rollout/sampler_num_cooled": float(sum(1 for st in self._tasks.values() if st.zero_streak >= 3)),
+            "rollout/sampler_num_cooled": float(
+                sum(1 for st in self._tasks.values() if st.zero_streak >= self.config.zero_cooldown_min_streak)
+            ),
             "rollout/sampler_visited_tasks": float(sum(1 for st in self._tasks.values() if st.update_ct > 0)),
+            "rollout/sampler_under_warmup": float(
+                sum(1 for st in self._tasks.values() if st.update_ct < self.config.warmup_obs_per_task)
+            ),
+            "rollout/sampler_max_over_min_upd": float(max_u / max(1, min_u)),
         }
         if self._batch_sampled_ps:
             metrics["rollout/sampler_sampled_p"] = sum(self._batch_sampled_ps) / len(self._batch_sampled_ps)

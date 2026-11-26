@@ -910,19 +910,38 @@ if __name__ == "__main__":
         "--rollout.adaptive_difficulty_enable",
         action="store_true",
         default=False,
-        help="Progressively sample harder learnable tasks across shared task seeds (also via MOLT_ADAPTIVE_DIFFICULTY=1).",
+        help="Progressively sample high-information tasks across shared task seeds (also via MOLT_ADAPTIVE_DIFFICULTY=1).",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_mode",
+        type=str,
+        default="variance",
+        choices=["variance", "frontier_v1"],
+        help="Scheduling curve: 'variance' (v2 symmetric Bernoulli-variance peaking at p=0.50 with anti-starvation) or 'frontier_v1' (legacy p*=0.30).",
     )
     parser.add_argument(
         "--rollout.adaptive_difficulty_alpha",
         type=float,
-        default=2.0,
-        help="Max difficulty sharpness exponent (ramped linearly from 0 to alpha over ramp_steps).",
+        default=1.5,
+        help="Max sharpness exponent (ramped linearly from 0 to alpha over ramp_steps after warmup_steps).",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_warmup_steps",
+        type=int,
+        default=10,
+        help="Initial training steps kept at alpha=0 (uniform calibration) before ramping adaptive weights.",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_warmup_obs",
+        type=int,
+        default=2,
+        help="Minimum valid group updates per task before adaptive reweighting applies to that task.",
     )
     parser.add_argument(
         "--rollout.adaptive_difficulty_ramp_steps",
         type=int,
         default=40,
-        help="Number of training batches to ramp adaptive difficulty sharpness from 0 to alpha.",
+        help="Number of training batches to ramp adaptive sharpness from 0 to alpha after warmup_steps.",
     )
     parser.add_argument(
         "--rollout.adaptive_difficulty_ema",
@@ -933,8 +952,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rollout.adaptive_difficulty_replay_floor",
         type=float,
-        default=0.05,
-        help="Minimum anti-forgetting sampling weight floor for mastered tasks.",
+        default=0.25,
+        help="Minimum anti-forgetting sampling weight floor for mastered/cooled tasks.",
+    )
+    parser.add_argument(
+        "--rollout.adaptive_difficulty_balance_exp",
+        type=float,
+        default=0.5,
+        help="Within-suite frequency-balance exponent damping oversampled tasks and lifting starved tasks.",
     )
 
     # Training (loop hyperparameters; optimizer/scheduler/grad-clip are in the shared block above)
